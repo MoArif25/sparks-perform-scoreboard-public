@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+sparks.db
+.streamlit/
+.DS_Store
