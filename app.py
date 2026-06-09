@@ -138,6 +138,9 @@ def _cached_leaderboard():
 
 
 def render_leaderboard_body() -> None:
+    """Lightweight live part: metrics + standings table only.
+    Kept minimal so the auto-refresh fragment redraws quickly without flicker.
+    """
     lb = _cached_leaderboard()
 
     if lb.empty:
@@ -179,6 +182,14 @@ def render_leaderboard_body() -> None:
         },
     )
 
+
+def render_leaderboard_extras() -> None:
+    """Static part: chart + explanation. Rendered once, not auto-refreshed,
+    so it doesn't flicker every refresh cycle."""
+    lb = _cached_leaderboard()
+    if lb.empty:
+        return
+
     st.subheader("Points by team")
     chart_df = lb.set_index("team")[["base_points", "time_bonus"]].rename(
         columns={"base_points": "Reviewer pts", "time_bonus": "Speed bonus"}
@@ -204,6 +215,10 @@ def tab_leaderboard() -> None:
         if st.button("🔄 Refresh now"):
             st.rerun()
         render_leaderboard_body()
+
+    # Static chart + explanation render once (outside the auto-refresh loop)
+    # so they don't flicker on every refresh cycle.
+    render_leaderboard_extras()
 
 
 # --------------------------------------------------------------------------- #

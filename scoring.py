@@ -540,7 +540,7 @@ def get_score_log() -> pd.DataFrame:
                       passed, notes, trainer_name,
                       CAST(logged_at AS TEXT) AS logged_at
                FROM score_log
-               ORDER BY logged_at DESC""",
+               ORDER BY id DESC""",
             conn)
 
 
