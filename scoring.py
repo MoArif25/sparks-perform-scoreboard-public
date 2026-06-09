@@ -28,6 +28,39 @@ STATUS_OPTIONS = ["Not Started", "In Progress", "Submitted", "Reviewed"]
 _PG_URL: str | None = None
 
 
+def _normalize_pg_url(url: str) -> str:
+    """Convert a Supabase *direct* connection URL into the IPv4-compatible
+    *session pooler* URL. Streamlit Cloud only supports IPv4, while Supabase
+    direct connections (db.<ref>.supabase.co) are IPv6-only, so we rewrite
+    them automatically to avoid 'Cannot assign requested address' errors.
+
+    Direct: postgresql://postgres:PWD@db.<ref>.supabase.co:5432/postgres
+    Pooler: postgresql://postgres.<ref>:PWD@<region>.pooler.supabase.com:5432/postgres
+    """
+    import re
+
+    m = re.match(
+        r"^postgres(?:ql)?://postgres:([^@]+)@db\.([a-z0-9]+)\.supabase\.co:(\d+)/([^?]+)",
+        url,
+    )
+    if not m:
+        return url  # already a pooler URL or some other host -> leave as-is
+
+    password, ref, port, dbname = m.groups()
+
+    region = "aws-1-us-east-1"
+    try:
+        import streamlit as st
+        region = str(st.secrets.get("SUPABASE_POOLER_REGION", region))
+    except Exception:
+        pass
+
+    return (
+        f"postgresql://postgres.{ref}:{password}"
+        f"@{region}.pooler.supabase.com:{port}/{dbname}"
+    )
+
+
 def _get_pg_url() -> str | None:
     global _PG_URL
     if _PG_URL is not None:
@@ -36,7 +69,7 @@ def _get_pg_url() -> str | None:
         import streamlit as st
         url = st.secrets.get("DATABASE_URL")
         if url:
-            _PG_URL = str(url)
+            _PG_URL = _normalize_pg_url(str(url))
             return _PG_URL
     except Exception:
         pass
