@@ -383,8 +383,8 @@ def tab_scenarios(can_edit: bool) -> None:
         if csv_file is not None:
             file_bytes = csv_file.getvalue()
             file_sig = hashlib.sha256(file_bytes).hexdigest()
-            st.caption("File selected. Click **Import now** to apply exactly once.")
-            if st.button("📥 Import now", key=f"csv_import_btn_{st.session_state['csv_import_nonce']}"):
+            st.caption("File selected. Click **Import and Save** to apply exactly once and persist it.")
+            if st.button("📥 Import and Save", key=f"csv_import_btn_{st.session_state['csv_import_nonce']}"):
                 if st.session_state.get("last_csv_import_sig") == file_sig:
                     st.info("This exact CSV was already imported. No changes applied.")
                 else:
@@ -398,22 +398,42 @@ def tab_scenarios(can_edit: bool) -> None:
                             # Merge imported data with existing
                             merged = edited.copy()
                             for _, row in imported_df.iterrows():
-                                num_val = row.get("num")
-                                if num_val is None or pd.isna(num_val):
+                                num_raw = row.get("num")
+                                if num_raw is None or pd.isna(num_raw):
                                     continue
-                                existing_mask = merged["num"] == num_val
+                                num_num = pd.to_numeric([num_raw], errors="coerce")[0]
+                                if pd.isna(num_num):
+                                    continue
+                                num_val = int(num_num)
+                                merged_nums = pd.to_numeric(merged.get("num"), errors="coerce")
+                                existing_mask = merged_nums == float(num_val)
                                 if existing_mask.any():
                                     row_idx = merged[existing_mask].index[0]
                                     for col in imported_df.columns:
-                                        if col in merged.columns and pd.notna(row[col]):
+                                        if col not in merged.columns:
+                                            merged[col] = ""
+                                        if pd.notna(row[col]):
                                             merged.at[row_idx, col] = row[col]
                                 else:
-                                    merged = pd.concat([merged, pd.DataFrame([row])], ignore_index=True)
-                            st.session_state["catalog_df"] = merged
-                            st.session_state["last_csv_import_sig"] = file_sig
-                            st.session_state["csv_import_nonce"] += 1
-                            st.success(f"Imported {len(imported_df)} scenarios. Review and save below.")
-                            st.rerun()
+                                    new_row = row.to_dict()
+                                    new_row["num"] = num_val
+                                    for col in imported_df.columns:
+                                        if col not in merged.columns:
+                                            merged[col] = ""
+                                    merged = pd.concat([merged, pd.DataFrame([new_row])], ignore_index=True)
+
+                            errors = _validate_catalog(merged)
+                            if errors:
+                                for e in errors:
+                                    st.error(e)
+                            else:
+                                catalog.save_catalog(merged)
+                                _cached_leaderboard.clear()
+                                st.session_state["catalog_df"] = catalog.load_catalog()
+                                st.session_state["last_csv_import_sig"] = file_sig
+                                st.session_state["csv_import_nonce"] += 1
+                                st.success(f"Imported and saved {len(imported_df)} scenarios.")
+                                st.rerun()
                     except Exception as e:
                         st.error(f"Error reading CSV: {e}")
 
@@ -467,7 +487,6 @@ def tab_scenarios(can_edit: bool) -> None:
                     st.error(e)
             else:
                 catalog.save_catalog(edited)
-                scoring.sync_scenarios(catalog.core_scenarios())
                 _cached_leaderboard.clear()
                 # Ensure other tabs (score entry / leaderboard) re-read the
                 # just-saved catalog in the same user interaction.
