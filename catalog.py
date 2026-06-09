@@ -24,6 +24,10 @@ CATALOG_PATH = Path(__file__).with_name("scenarios_catalog.csv")
 
 CORE_COLUMNS = ["num", "title", "max_points", "est_minutes"]
 
+# These columns are stored in the main scenarios table (not catalog_extra).
+# Keeping this separate from CORE_COLUMNS avoids changing UI validation rules.
+SCENARIO_DB_COLUMNS = {"num", "title", "max_points", "est_minutes", "scoring", "day"}
+
 DEFAULT_COLUMNS = [
     "num",
     "title",
@@ -75,6 +79,11 @@ def _pg_load() -> pd.DataFrame:
             conn,
         )
 
+    # Guard against legacy/stale rows where DB-core columns were written
+    # into catalog_extra. Those would collide on merge (e.g. scoring/day).
+    if not extra_df.empty:
+        extra_df = extra_df[~extra_df["col_name"].isin(SCENARIO_DB_COLUMNS)]
+
     if extra_df.empty:
         return core_df.astype(str).replace("None", "").replace("nan", "")
 
@@ -91,7 +100,8 @@ def _pg_save(df: pd.DataFrame) -> None:
     catalog_extra entirely and rewrite it. This guarantees that removed
     scenarios (or removed columns) don't leave stale rows behind.
     """
-    extra_cols = [c for c in df.columns if c not in CORE_COLUMNS]
+    # Only persist truly extra columns. DB-core columns must stay in scenarios.
+    extra_cols = [c for c in df.columns if c not in SCENARIO_DB_COLUMNS]
     with _scoring._connect() as conn:
         # Wipe ALL extra data and rewrite from the edited df (authoritative).
         _scoring._execute(conn, "DELETE FROM catalog_extra")
