@@ -85,20 +85,21 @@ def _pg_load() -> pd.DataFrame:
 
 
 def _pg_save(df: pd.DataFrame) -> None:
-    """Persist the full catalog DataFrame back to the DB."""
+    """Persist the full catalog DataFrame back to the DB.
+
+    Authoritative: the edited DataFrame is the complete catalog, so we wipe
+    catalog_extra entirely and rewrite it. This guarantees that removed
+    scenarios (or removed columns) don't leave stale rows behind.
+    """
     extra_cols = [c for c in df.columns if c not in CORE_COLUMNS]
     with _scoring._connect() as conn:
-        # Wipe and rewrite catalog_extra for all rows in the edited df.
-        nums = [int(r["num"]) for _, r in df.iterrows()
-                if str(r.get("num", "")).strip().lstrip("-").isdigit()]
-        if nums:
-            ph = ",".join(["%s" if _scoring._is_pg() else "?"] * len(nums))
-            _scoring._execute(conn, f"DELETE FROM catalog_extra WHERE num IN ({ph})", nums)
+        # Wipe ALL extra data and rewrite from the edited df (authoritative).
+        _scoring._execute(conn, "DELETE FROM catalog_extra")
 
         for _, row in df.iterrows():
             try:
                 num = int(row["num"])
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, TypeError):
                 continue
             for col in extra_cols:
                 val = str(row.get(col, ""))
@@ -118,8 +119,10 @@ def load_catalog() -> pd.DataFrame:
     """Load the catalog from DB (Postgres) or CSV (SQLite)."""
     if _scoring._is_pg():
         df = _pg_load()
-        if df.empty:
-            # First run: seed from scenarios.py into DB
+        # Only seed from scenarios.py on the very first run (before any save).
+        # Once the catalog has been initialized, an empty catalog is a
+        # deliberate state (trainer deleted all rows) and must NOT be re-seeded.
+        if df.empty and _scoring.get_setting("catalog_initialized") != "1":
             seed = _seed_dataframe()
             save_catalog(seed)
             df = _pg_load()
@@ -138,6 +141,9 @@ def save_catalog(df: pd.DataFrame) -> None:
         _pg_save(df)
         # Also push core columns into scenarios table
         _scoring.sync_scenarios(core_scenarios_from_df(df))
+        # Mark catalog as initialized so an intentionally-empty catalog is
+        # never re-seeded from scenarios.py on the next load.
+        _scoring.set_setting("catalog_initialized", "1")
     else:
         df.to_csv(CATALOG_PATH, index=False)
 

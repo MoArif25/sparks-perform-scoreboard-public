@@ -451,6 +451,11 @@ def sync_scenarios(core: pd.DataFrame) -> None:
             _execute(conn,
                 f"DELETE FROM scenarios WHERE num NOT IN ({ph})",
                 keep_nums)
+        else:
+            # Catalog was intentionally emptied -> remove all scenarios.
+            # (Previously this branch was skipped, so 'delete all' never
+            #  persisted and rows reappeared on the next load.)
+            _execute(conn, "DELETE FROM scenarios")
 
 
 # ---------------------------------------------------------------------------
