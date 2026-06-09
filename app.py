@@ -129,9 +129,16 @@ def trainer_gate() -> bool:
 # --------------------------------------------------------------------------- #
 # Leaderboard
 # --------------------------------------------------------------------------- #
-def render_leaderboard_body() -> None:
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_leaderboard():
+    """Cache leaderboard reads for 10s so live refreshes don't hit the
+    database on every redraw. Cleared immediately when a score is saved."""
     bonus_table = scoring.get_time_bonus_table()
-    lb = scoring.build_leaderboard(bonus_table)
+    return scoring.build_leaderboard(bonus_table)
+
+
+def render_leaderboard_body() -> None:
+    lb = _cached_leaderboard()
 
     if lb.empty:
         st.info("No teams yet.")
@@ -179,12 +186,12 @@ def render_leaderboard_body() -> None:
     st.bar_chart(chart_df, color=["#1f77b4", "#ff7f0e"])
 
     with st.expander("ℹ️ How scoring & the speed bonus work"):
-        st.markdown(scoring.speed_bonus_explanation(bonus_table))
+        st.markdown(scoring.speed_bonus_explanation())
 
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=15)
 def live_leaderboard() -> None:
-    st.caption("🔴 Live · refreshes every 5 seconds")
+    st.caption("🔴 Live · refreshes every 15 seconds")
     render_leaderboard_body()
 
 
@@ -276,6 +283,7 @@ def tab_score_entry() -> None:
             status=status, points=points, minutes=None if minutes == 0 else minutes,
             passed=passed, notes=notes, trainer_name=trainer_name,
         )
+        _cached_leaderboard.clear()
         st.success("Saved. The leaderboard updates on its next refresh.")
 
     with st.expander("ℹ️ How the speed bonus is allotted"):
