@@ -26,6 +26,7 @@ DEFAULT_TIME_BONUS_TABLE = [5, 3, 2, 1]
 STATUS_OPTIONS = ["Not Started", "In Progress", "Submitted", "Reviewed"]
 
 _PG_URL: str | None = None
+_BACKEND: str | None = None  # "pg" or "sqlite", decided once per process
 
 
 def _normalize_pg_url(url: str) -> str:
@@ -62,7 +63,7 @@ def _normalize_pg_url(url: str) -> str:
 
 
 def _get_pg_url() -> str | None:
-    global _PG_URL
+    global _PG_URL, _BACKEND
     if _PG_URL is not None:
         return _PG_URL
     try:
@@ -70,20 +71,48 @@ def _get_pg_url() -> str | None:
         url = st.secrets.get("DATABASE_URL")
         if url:
             _PG_URL = _normalize_pg_url(str(url))
+            _BACKEND = "pg"
             return _PG_URL
     except Exception:
         pass
     return None
 
 
+def _resolve_backend() -> str:
+    """Decide ONCE whether this process talks to Postgres or SQLite, and keep
+    that decision sticky for the whole process.
+
+    This prevents a dangerous failure mode on Streamlit Cloud: if reading
+    st.secrets transiently returns nothing inside a fragment/thread context,
+    the app could silently fall back to a *different* (empty, ephemeral) SQLite
+    database mid-session, making committed Supabase rows appear to come and go.
+    Once we have ever seen a DATABASE_URL, we stay on Postgres permanently.
+    """
+    global _BACKEND
+    if _BACKEND is not None:
+        return _BACKEND
+    if _get_pg_url():          # sets _BACKEND = "pg" on success
+        return _BACKEND
+    _BACKEND = "sqlite"        # no secret configured -> local dev mode
+    return _BACKEND
+
+
 def _is_pg() -> bool:
-    return _get_pg_url() is not None
+    return _resolve_backend() == "pg"
 
 
 @contextmanager
 def _connect():
-    pg_url = _get_pg_url()
-    if pg_url:
+    if _is_pg():
+        pg_url = _get_pg_url()
+        if not pg_url:
+            # We are in Postgres mode but the URL could not be read. Do NOT
+            # silently fall back to SQLite (that would expose a different,
+            # empty database). Fail loudly so the problem is visible.
+            raise RuntimeError(
+                "DATABASE_URL is configured (Postgres mode) but could not be "
+                "read from st.secrets. Refusing to fall back to local SQLite."
+            )
         import psycopg2
         conn = psycopg2.connect(pg_url)
         conn.autocommit = False
@@ -565,11 +594,32 @@ def compute_time_bonus(scores: pd.DataFrame, bonus_table: list[int]) -> pd.DataF
 
 
 def build_leaderboard(bonus_table: list[int] | None = None) -> pd.DataFrame:
-    if bonus_table is None:
-        bonus_table = get_time_bonus_table()
+    # Read everything we need over a SINGLE connection. Previously this opened
+    # three separate connections (settings, teams, scores); on Supabase each
+    # new pooled connection adds a network round-trip, and doing that on every
+    # 15s live refresh caused latency spikes and visible flicker.
+    with _connect() as conn:
+        if bonus_table is None:
+            row = _fetchone(conn,
+                "SELECT value FROM settings WHERE key=?", ("time_bonus_table",))
+            raw = row["value"] if row else None
+            if raw:
+                try:
+                    bonus_table = [int(x) for x in raw.split(",") if x.strip() != ""]
+                except ValueError:
+                    bonus_table = list(DEFAULT_TIME_BONUS_TABLE)
+            else:
+                bonus_table = list(DEFAULT_TIME_BONUS_TABLE)
 
-    teams = get_teams()
-    scores = get_all_scores()
+        teams = _read_sql("SELECT id, name FROM teams ORDER BY name", conn)
+        scores = _read_sql(
+            """SELECT s.team_id, t.name AS team, s.scenario_num,
+                      s.status, s.points, s.minutes, s.passed
+               FROM scores s
+               JOIN teams t ON t.id = s.team_id
+               ORDER BY s.scenario_num, t.name""",
+            conn)
+
     scores = compute_time_bonus(scores, bonus_table)
 
     rows = []
