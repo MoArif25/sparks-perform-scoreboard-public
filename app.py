@@ -304,7 +304,8 @@ def tab_score_entry() -> None:
     with st.expander("ℹ️ How the speed bonus is allotted"):
         st.markdown(scoring.speed_bonus_explanation())
 
-    st.subheader("This scenario — all teams")
+    st.subheader("This scenario — all teams (score snapshot)")
+    st.caption("This table is filtered by the currently selected scenario and is not the audit log.")
     all_scores = scoring.get_all_scores()
     this_scen = all_scores[all_scores["scenario_num"] == scen_num]
     if this_scen.empty:
@@ -316,6 +317,21 @@ def tab_score_entry() -> None:
         )
         view["Passed"] = view["Passed"].map({1: "✅", 0: ""})
         st.dataframe(view, hide_index=True, use_container_width=True)
+
+    st.divider()
+    st.subheader("Score entry audit log — all scenarios")
+    score_log = scoring.get_score_log()
+    if score_log.empty:
+        st.caption("No score entry logs recorded yet.")
+    else:
+        st.caption(f"Showing {len(score_log)} log entries across all scenarios.")
+        st.dataframe(score_log, hide_index=True, use_container_width=True)
+        st.download_button(
+            "⬇️ Export full audit log (CSV)",
+            data=score_log.to_csv(index=False).encode("utf-8"),
+            file_name="spark_score_entry_log.csv",
+            mime="text/csv",
+        )
 
 
 # --------------------------------------------------------------------------- #
