@@ -1,23 +1,12 @@
 """
-SQLite data layer and scoring logic for the SPARKS PERFORM Week scoreboard.
+Dual-backend data layer and scoring logic for the SPARK PERFORM Week scoreboard.
 
-Design goals: zero external services, single self-contained file (sparks.db),
-easy to back up (just copy the .db file) and reset.
+Backend selection (automatic):
+  * Postgres  -- when st.secrets["DATABASE_URL"] is set (Supabase / any hosted PG)
+  * SQLite    -- fallback for local development (sparks.db next to this file)
 
-Scoring model
--------------
-Per scenario, a trainer records for each team:
-    * status   : Not Started / In Progress / Submitted / Reviewed
-    * points   : reviewer-awarded points (0..max_points)
-    * minutes  : time taken to complete (used for time bonus + tiebreaker)
-    * passed   : whether the solution met the bar (eligible for time bonus)
-
-Team total = sum(points across scenarios) + sum(time_bonus across scenarios)
-
-Time bonus (per scenario): among teams that PASSED a scenario, rank by minutes
-ascending; the fastest teams receive bonus points from TIME_BONUS_TABLE.
-
-Tiebreaker: equal total points -> lower total minutes ranks higher.
+All SQL is compatible with both backends. Placeholders are translated
+from ? (SQLite) to %s (Postgres) automatically in _execute / _fetchone.
 """
 
 from __future__ import annotations
@@ -33,97 +22,218 @@ from scenarios import DEFAULT_MAX_POINTS, SCENARIOS
 
 DB_PATH = Path(__file__).with_name("sparks.db")
 
-# Bonus points awarded to the fastest passing teams, position 1..N.
-# Edit / extend this list to change how aggressive the speed reward is.
 DEFAULT_TIME_BONUS_TABLE = [5, 3, 2, 1]
-
 STATUS_OPTIONS = ["Not Started", "In Progress", "Submitted", "Reviewed"]
+
+_PG_URL: str | None = None
+
+
+def _get_pg_url() -> str | None:
+    global _PG_URL
+    if _PG_URL is not None:
+        return _PG_URL
+    try:
+        import streamlit as st
+        url = st.secrets.get("DATABASE_URL")
+        if url:
+            _PG_URL = str(url)
+            return _PG_URL
+    except Exception:
+        pass
+    return None
+
+
+def _is_pg() -> bool:
+    return _get_pg_url() is not None
 
 
 @contextmanager
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    pg_url = _get_pg_url()
+    if pg_url:
+        import psycopg2
+        conn = psycopg2.connect(pg_url)
+        conn.autocommit = False
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
 
+def _execute(conn, sql: str, params=()) -> None:
+    """Execute a write statement, translating ? placeholders for Postgres."""
+    if _is_pg():
+        conn.cursor().execute(sql.replace("?", "%s"), params)
+    else:
+        conn.execute(sql, params)
+
+
+def _fetchone(conn, sql: str, params=()):
+    if _is_pg():
+        cur = conn.cursor()
+        cur.execute(sql.replace("?", "%s"), params)
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+    else:
+        row = conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+
+def _read_sql(sql: str, conn) -> pd.DataFrame:
+    return pd.read_sql_query(sql, conn)
+
+
+# ---------------------------------------------------------------------------
+# Schema creation
+# ---------------------------------------------------------------------------
 def init_db() -> None:
-    """Create tables (if needed) and seed scenarios."""
+    """Create tables if they do not already exist."""
     with _connect() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS teams (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                name    TEXT NOT NULL UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS scenarios (
-                num        INTEGER PRIMARY KEY,
-                title      TEXT NOT NULL,
-                max_points INTEGER NOT NULL,
-                est_minutes INTEGER,
-                scoring    TEXT,
-                day        TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS scores (
-                team_id      INTEGER NOT NULL,
-                scenario_num INTEGER NOT NULL,
-                status       TEXT NOT NULL DEFAULT 'Not Started',
-                points       REAL NOT NULL DEFAULT 0,
-                minutes      REAL,
-                passed       INTEGER NOT NULL DEFAULT 0,
-                notes        TEXT,
-                updated_at   TEXT DEFAULT (datetime('now')),
-                PRIMARY KEY (team_id, scenario_num),
-                FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE,
-                FOREIGN KEY (scenario_num) REFERENCES scenarios(num)
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
-            """
-        )
-        # Seed / refresh scenario catalog.
-        for s in SCENARIOS:
-            max_pts = s["max_points"] if s["max_points"] is not None else DEFAULT_MAX_POINTS
-            conn.execute(
+        if _is_pg():
+            stmts = [
+                """CREATE TABLE IF NOT EXISTS teams (
+                    id      SERIAL PRIMARY KEY,
+                    name    TEXT NOT NULL UNIQUE
+                )""",
+                """CREATE TABLE IF NOT EXISTS scenarios (
+                    num         INTEGER PRIMARY KEY,
+                    title       TEXT NOT NULL,
+                    max_points  INTEGER NOT NULL,
+                    est_minutes REAL,
+                    scoring     TEXT,
+                    day         TEXT
+                )""",
+                """CREATE TABLE IF NOT EXISTS scores (
+                    team_id      INTEGER NOT NULL,
+                    scenario_num INTEGER NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'Not Started',
+                    points       REAL NOT NULL DEFAULT 0,
+                    minutes      REAL,
+                    passed       INTEGER NOT NULL DEFAULT 0,
+                    notes        TEXT,
+                    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (team_id, scenario_num),
+                    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+                )""",
+                """CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )""",
+                """CREATE TABLE IF NOT EXISTS catalog_extra (
+                    num       INTEGER NOT NULL,
+                    col_name  TEXT NOT NULL,
+                    col_value TEXT,
+                    PRIMARY KEY (num, col_name)
+                )""",
+                """CREATE TABLE IF NOT EXISTS score_log (
+                    id           SERIAL PRIMARY KEY,
+                    team_id      INTEGER NOT NULL,
+                    team_name    TEXT NOT NULL,
+                    scenario_num INTEGER NOT NULL,
+                    status       TEXT,
+                    points       REAL,
+                    minutes      REAL,
+                    passed       INTEGER,
+                    notes        TEXT,
+                    trainer_name TEXT NOT NULL,
+                    logged_at    TIMESTAMPTZ DEFAULT NOW(),
+                    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+                )""",
+            ]
+            for stmt in stmts:
+                _execute(conn, stmt)
+        else:
+            conn.executescript(
                 """
-                INSERT INTO scenarios (num, title, max_points, est_minutes, scoring, day)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(num) DO UPDATE SET
-                    title=excluded.title,
-                    max_points=excluded.max_points,
-                    est_minutes=excluded.est_minutes,
-                    scoring=excluded.scoring,
-                    day=excluded.day
-                """,
-                (s["num"], s["title"], max_pts, s["est_minutes"], s["scoring"], s["day"]),
+                CREATE TABLE IF NOT EXISTS teams (
+                    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS scenarios (
+                    num         INTEGER PRIMARY KEY,
+                    title       TEXT NOT NULL,
+                    max_points  INTEGER NOT NULL,
+                    est_minutes REAL,
+                    scoring     TEXT,
+                    day         TEXT
+                );
+                CREATE TABLE IF NOT EXISTS scores (
+                    team_id      INTEGER NOT NULL,
+                    scenario_num INTEGER NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'Not Started',
+                    points       REAL NOT NULL DEFAULT 0,
+                    minutes      REAL,
+                    passed       INTEGER NOT NULL DEFAULT 0,
+                    notes        TEXT,
+                    updated_at   TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (team_id, scenario_num),
+                    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                CREATE TABLE IF NOT EXISTS catalog_extra (
+                    num       INTEGER NOT NULL,
+                    col_name  TEXT NOT NULL,
+                    col_value TEXT,
+                    PRIMARY KEY (num, col_name)
+                );
+                CREATE TABLE IF NOT EXISTS score_log (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id      INTEGER NOT NULL,
+                    team_name    TEXT NOT NULL,
+                    scenario_num INTEGER NOT NULL,
+                    status       TEXT,
+                    points       REAL,
+                    minutes      REAL,
+                    passed       INTEGER,
+                    notes        TEXT,
+                    trainer_name TEXT NOT NULL,
+                    logged_at    TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+                );
+                """
             )
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # Settings
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 def get_setting(key: str, default: str | None = None) -> str | None:
     with _connect() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        row = _fetchone(conn, "SELECT value FROM settings WHERE key=?", (key,))
     return row["value"] if row else default
 
 
 def set_setting(key: str, value: str) -> None:
     with _connect() as conn:
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+        if _is_pg():
+            _execute(conn,
+                "INSERT INTO settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, value))
+        else:
+            _execute(conn,
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value))
 
 
 def get_time_bonus_table() -> list[int]:
@@ -141,37 +251,30 @@ def set_time_bonus_table(values: Iterable[int]) -> None:
 
 
 def get_dashboard_title() -> str:
-    """Get the custom dashboard title, or the default if not set."""
-    return get_setting("dashboard_title") or "⚡ SPARKS PERFORM Week — Live Leaderboard"
+    return get_setting("dashboard_title") or "SPARK PERFORM Week - Live Leaderboard"
 
 
 def set_dashboard_title(title: str) -> None:
-    """Set the custom dashboard title."""
     set_setting("dashboard_title", title.strip())
 
 
 def get_sidebar_title() -> str:
-    """Get the custom sidebar title, or the default if not set."""
-    return get_setting("sidebar_title") or "⚡ SPARKS Scoreboard"
+    return get_setting("sidebar_title") or "SPARK Scoreboard"
 
 
 def set_sidebar_title(title: str) -> None:
-    """Set the custom sidebar title."""
     set_setting("sidebar_title", title.strip())
 
 
 def get_sidebar_subtitle() -> str:
-    """Get the custom sidebar subtitle, or the default if not set."""
-    return get_setting("sidebar_subtitle") or "PERFORM Week · Module 3"
+    return get_setting("sidebar_subtitle") or "PERFORM Week - Module 3"
 
 
 def set_sidebar_subtitle(subtitle: str) -> None:
-    """Set the custom sidebar subtitle."""
     set_setting("sidebar_subtitle", subtitle.strip())
 
 
 def speed_bonus_explanation(bonus_table: list[int] | None = None) -> str:
-    """Return a human-readable markdown explanation of how the speed bonus works."""
     if bonus_table is None:
         bonus_table = get_time_bonus_table()
 
@@ -190,9 +293,9 @@ def speed_bonus_explanation(bonus_table: list[int] | None = None) -> str:
         "",
     ]
     for i, v in enumerate(bonus_table, start=1):
-        lines.append(f"- {ordinal(i)} passing team → **+{v} pts**")
+        lines.append(f"- {ordinal(i)} passing team -> **+{v} pts**")
     lines += [
-        "- Everyone slower (or who didn't pass / wasn't timed) → **+0 pts**",
+        "- Everyone slower (or who did not pass / was not timed) -> **+0 pts**",
         "",
         "These bonuses are summed across all scenarios and added to the reviewer "
         "points to form each team's **Total**. If two teams have the same total, the "
@@ -201,15 +304,20 @@ def speed_bonus_explanation(bonus_table: list[int] | None = None) -> str:
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # Teams
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 def add_team(name: str) -> None:
     name = name.strip()
     if not name:
         return
     with _connect() as conn:
-        conn.execute("INSERT OR IGNORE INTO teams (name) VALUES (?)", (name,))
+        if _is_pg():
+            _execute(conn,
+                "INSERT INTO teams (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                (name,))
+        else:
+            _execute(conn, "INSERT OR IGNORE INTO teams (name) VALUES (?)", (name,))
 
 
 def rename_team(team_id: int, new_name: str) -> None:
@@ -217,68 +325,75 @@ def rename_team(team_id: int, new_name: str) -> None:
     if not new_name:
         return
     with _connect() as conn:
-        conn.execute("UPDATE teams SET name=? WHERE id=?", (new_name, team_id))
+        _execute(conn, "UPDATE teams SET name=? WHERE id=?", (new_name, team_id))
 
 
 def delete_team(team_id: int) -> None:
     with _connect() as conn:
-        conn.execute("DELETE FROM teams WHERE id=?", (team_id,))
+        _execute(conn, "DELETE FROM teams WHERE id=?", (team_id,))
 
 
 def get_teams() -> pd.DataFrame:
     with _connect() as conn:
-        return pd.read_sql_query("SELECT id, name FROM teams ORDER BY name", conn)
+        return _read_sql("SELECT id, name FROM teams ORDER BY name", conn)
 
 
 def ensure_default_teams(count: int = 10) -> None:
-    """Create 'Team 01'..'Team NN' if no teams exist yet."""
     if len(get_teams()) == 0:
         for i in range(1, count + 1):
             add_team(f"Team {i:02d}")
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # Scenarios
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 def get_scenarios() -> pd.DataFrame:
     with _connect() as conn:
-        return pd.read_sql_query("SELECT * FROM scenarios ORDER BY num", conn)
+        return _read_sql("SELECT * FROM scenarios ORDER BY num", conn)
 
 
 def sync_scenarios(core: pd.DataFrame) -> None:
-    """Sync the DB scenarios table from the editable catalog's core columns.
-
-    ``core`` must have columns: num, title, max_points, est_minutes, scoring.
-    Scenarios present in the DB but missing from the catalog are removed (their
-    historical scores are kept; the leaderboard still counts them).
-    """
+    """Sync the scenarios table from the catalog core columns."""
     keep_nums = [int(n) for n in core["num"].tolist()]
     with _connect() as conn:
         for _, r in core.iterrows():
             est = None if pd.isna(r.get("est_minutes")) else float(r["est_minutes"])
-            conn.execute(
-                """
-                INSERT INTO scenarios (num, title, max_points, est_minutes, scoring, day)
-                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT day FROM scenarios WHERE num=?), ''))
-                ON CONFLICT(num) DO UPDATE SET
-                    title=excluded.title,
-                    max_points=excluded.max_points,
-                    est_minutes=excluded.est_minutes,
-                    scoring=excluded.scoring
-                """,
-                (int(r["num"]), str(r["title"]), int(r["max_points"]),
-                 est, str(r.get("scoring", "")), int(r["num"])),
-            )
+            if _is_pg():
+                _execute(conn,
+                    """INSERT INTO scenarios
+                           (num, title, max_points, est_minutes, scoring, day)
+                       VALUES (%s, %s, %s, %s, %s,
+                               COALESCE((SELECT day FROM scenarios WHERE num=%s), ''))
+                       ON CONFLICT (num) DO UPDATE SET
+                           title=EXCLUDED.title,
+                           max_points=EXCLUDED.max_points,
+                           est_minutes=EXCLUDED.est_minutes,
+                           scoring=EXCLUDED.scoring""",
+                    (int(r["num"]), str(r["title"]), int(r["max_points"]),
+                     est, str(r.get("scoring", "")), int(r["num"])))
+            else:
+                _execute(conn,
+                    """INSERT INTO scenarios
+                           (num, title, max_points, est_minutes, scoring, day)
+                       VALUES (?, ?, ?, ?, ?,
+                               COALESCE((SELECT day FROM scenarios WHERE num=?), ''))
+                       ON CONFLICT(num) DO UPDATE SET
+                           title=excluded.title,
+                           max_points=excluded.max_points,
+                           est_minutes=excluded.est_minutes,
+                           scoring=excluded.scoring""",
+                    (int(r["num"]), str(r["title"]), int(r["max_points"]),
+                     est, str(r.get("scoring", "")), int(r["num"])))
         if keep_nums:
-            placeholders = ",".join("?" for _ in keep_nums)
-            conn.execute(
-                f"DELETE FROM scenarios WHERE num NOT IN ({placeholders})", keep_nums
-            )
+            ph = ",".join(["%s" if _is_pg() else "?"] * len(keep_nums))
+            _execute(conn,
+                f"DELETE FROM scenarios WHERE num NOT IN ({ph})",
+                keep_nums)
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # Scores
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 def upsert_score(
     team_id: int,
     scenario_num: int,
@@ -289,85 +404,134 @@ def upsert_score(
     notes: str | None,
 ) -> None:
     with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO scores (team_id, scenario_num, status, points, minutes, passed, notes, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(team_id, scenario_num) DO UPDATE SET
-                status=excluded.status,
-                points=excluded.points,
-                minutes=excluded.minutes,
-                passed=excluded.passed,
-                notes=excluded.notes,
-                updated_at=datetime('now')
-            """,
-            (team_id, scenario_num, status, float(points),
-             None if minutes in (None, "") else float(minutes),
-             1 if passed else 0, notes),
-        )
+        if _is_pg():
+            _execute(conn,
+                """INSERT INTO scores
+                       (team_id, scenario_num, status, points, minutes,
+                        passed, notes, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                   ON CONFLICT (team_id, scenario_num) DO UPDATE SET
+                       status=EXCLUDED.status,
+                       points=EXCLUDED.points,
+                       minutes=EXCLUDED.minutes,
+                       passed=EXCLUDED.passed,
+                       notes=EXCLUDED.notes,
+                       updated_at=NOW()""",
+                (team_id, scenario_num, status, float(points),
+                 None if minutes in (None, "") else float(minutes),
+                 1 if passed else 0, notes))
+        else:
+            _execute(conn,
+                """INSERT INTO scores
+                       (team_id, scenario_num, status, points, minutes,
+                        passed, notes, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                   ON CONFLICT(team_id, scenario_num) DO UPDATE SET
+                       status=excluded.status,
+                       points=excluded.points,
+                       minutes=excluded.minutes,
+                       passed=excluded.passed,
+                       notes=excluded.notes,
+                       updated_at=datetime('now')""",
+                (team_id, scenario_num, status, float(points),
+                 None if minutes in (None, "") else float(minutes),
+                 1 if passed else 0, notes))
 
 
 def get_score(team_id: int, scenario_num: int) -> dict | None:
     with _connect() as conn:
-        row = conn.execute(
+        return _fetchone(conn,
             "SELECT * FROM scores WHERE team_id=? AND scenario_num=?",
-            (team_id, scenario_num),
-        ).fetchone()
-    return dict(row) if row else None
+            (team_id, scenario_num))
 
 
 def get_all_scores() -> pd.DataFrame:
     with _connect() as conn:
-        return pd.read_sql_query(
-            """
-            SELECT s.team_id, t.name AS team, s.scenario_num,
-                   COALESCE(sc.title, 'Scenario #' || s.scenario_num) AS scenario,
-                   s.status, s.points, s.minutes, s.passed, s.notes, s.updated_at,
-                   COALESCE(sc.max_points, 0) AS max_points
-            FROM scores s
-            JOIN teams t           ON t.id = s.team_id
-            LEFT JOIN scenarios sc ON sc.num = s.scenario_num
-            ORDER BY s.scenario_num, t.name
-            """,
-            conn,
-        )
+        return _read_sql(
+            """SELECT s.team_id, t.name AS team, s.scenario_num,
+                      COALESCE(sc.title,
+                               'Scenario #' || CAST(s.scenario_num AS TEXT)) AS scenario,
+                      s.status, s.points, s.minutes, s.passed, s.notes,
+                      CAST(s.updated_at AS TEXT) AS updated_at,
+                      COALESCE(sc.max_points, 0) AS max_points
+               FROM scores s
+               JOIN teams t           ON t.id = s.team_id
+               LEFT JOIN scenarios sc ON sc.num = s.scenario_num
+               ORDER BY s.scenario_num, t.name""",
+            conn)
 
 
 def reset_all_scores() -> None:
     with _connect() as conn:
-        conn.execute("DELETE FROM scores")
+        _execute(conn, "DELETE FROM scores")
 
 
-# --------------------------------------------------------------------------- #
+def log_score_entry(
+    team_id: int,
+    team_name: str,
+    scenario_num: int,
+    status: str,
+    points: float,
+    minutes: float | None,
+    passed: bool,
+    notes: str | None,
+    trainer_name: str,
+) -> None:
+    """Log a score entry to the audit trail."""
+    with _connect() as conn:
+        if _is_pg():
+            _execute(conn,
+                """INSERT INTO score_log
+                       (team_id, team_name, scenario_num, status, points, minutes,
+                        passed, notes, trainer_name, logged_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+                (team_id, team_name, scenario_num, status, float(points),
+                 None if minutes in (None, "") else float(minutes),
+                 1 if passed else 0, notes, trainer_name))
+        else:
+            _execute(conn,
+                """INSERT INTO score_log
+                       (team_id, team_name, scenario_num, status, points, minutes,
+                        passed, notes, trainer_name, logged_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                (team_id, team_name, scenario_num, status, float(points),
+                 None if minutes in (None, "") else float(minutes),
+                 1 if passed else 0, notes, trainer_name))
+
+
+def get_score_log() -> pd.DataFrame:
+    """Retrieve the complete score entry audit log."""
+    with _connect() as conn:
+        return _read_sql(
+            """SELECT id, team_id, team_name, scenario_num, status, points, minutes,
+                      passed, notes, trainer_name,
+                      CAST(logged_at AS TEXT) AS logged_at
+               FROM score_log
+               ORDER BY logged_at DESC""",
+            conn)
+
+
+# ---------------------------------------------------------------------------
 # Scoring computation
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 def compute_time_bonus(scores: pd.DataFrame, bonus_table: list[int]) -> pd.DataFrame:
-    """Return scores with a 'time_bonus' column added.
-
-    Per scenario, passing teams with a recorded minutes value are ranked
-    fastest-first; ranks 1..N receive bonus_table[0..N-1] points.
-    """
     scores = scores.copy()
     scores["time_bonus"] = 0.0
-    if scores.empty:
-        return scores
-
-    eligible = scores[(scores["passed"] == 1) & (scores["minutes"].notna())]
-    for scen, grp in eligible.groupby("scenario_num"):
-        ordered = grp.sort_values("minutes", ascending=True)
-        for rank, (idx, _row) in enumerate(ordered.iterrows()):
+    for scen_num in scores["scenario_num"].unique():
+        mask = (
+            (scores["scenario_num"] == scen_num)
+            & (scores["passed"] == 1)
+            & (scores["minutes"].notna())
+            & (scores["minutes"] > 0)
+        )
+        eligible = scores.loc[mask].sort_values("minutes")
+        for rank, idx in enumerate(eligible.index):
             if rank < len(bonus_table):
-                scores.loc[idx, "time_bonus"] = float(bonus_table[rank])
+                scores.at[idx, "time_bonus"] = float(bonus_table[rank])
     return scores
 
 
 def build_leaderboard(bonus_table: list[int] | None = None) -> pd.DataFrame:
-    """Aggregate per-team totals and rank them.
-
-    Returns a DataFrame with columns:
-        rank, team, base_points, time_bonus, total_points,
-        scenarios_completed, total_minutes
-    """
     if bonus_table is None:
         bonus_table = get_time_bonus_table()
 
@@ -382,22 +546,19 @@ def build_leaderboard(bonus_table: list[int] | None = None) -> pd.DataFrame:
         base = float(t["points"].sum())
         bonus = float(t["time_bonus"].sum())
         total_minutes = float(t["minutes"].fillna(0).sum())
-        rows.append(
-            {
-                "team": team["name"],
-                "base_points": round(base, 1),
-                "time_bonus": round(bonus, 1),
-                "total_points": round(base + bonus, 1),
-                "scenarios_completed": int(len(completed)),
-                "total_minutes": round(total_minutes, 1),
-            }
-        )
+        rows.append({
+            "team": team["name"],
+            "base_points": round(base, 1),
+            "time_bonus": round(bonus, 1),
+            "total_points": round(base + bonus, 1),
+            "scenarios_completed": int(len(completed)),
+            "total_minutes": round(total_minutes, 1),
+        })
 
     lb = pd.DataFrame(rows)
     if lb.empty:
         return lb
 
-    # Points first (desc); tiebreaker = total minutes (asc, faster wins).
     lb = lb.sort_values(
         by=["total_points", "total_minutes"],
         ascending=[False, True],

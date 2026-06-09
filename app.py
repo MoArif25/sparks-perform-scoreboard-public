@@ -1,5 +1,5 @@
 """
-SPARKS Module 3 - PERFORM Week live scoreboard.
+SPARK Module 3 - PERFORM Week live scoreboard.
 
 Run with:
     streamlit run app.py
@@ -15,6 +15,9 @@ Access model
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 
@@ -22,7 +25,7 @@ import catalog
 import scoring
 
 st.set_page_config(
-    page_title="SPARKS PERFORM Week Scoreboard",
+    page_title="SPARK PERFORM Week Scoreboard",
     page_icon="⚡",
     layout="wide",
 )
@@ -33,7 +36,66 @@ scoring.ensure_default_teams(10)
 scoring.sync_scenarios(catalog.core_scenarios())
 
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
-DEFAULT_TRAINER_PASSWORD = "sparks2026"
+DEFAULT_TRAINER_PASSWORD = "spark2026"
+LOGO_CANDIDATE_NAMES = [
+    "spark_logo.png",
+    "spark_logo.jpg",
+    "spark_logo.jpeg",
+    "spark-logo.png",
+    "spark-logo.jpg",
+    "spark-logo.jpeg",
+    "logo.png",
+    "logo.jpg",
+    "logo.jpeg",
+]
+
+
+def get_logo_path() -> Path | None:
+    base_dir = Path(__file__).resolve().parent
+    for name in LOGO_CANDIDATE_NAMES:
+        candidate = base_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def strip_brand_prefix(text: str) -> str:
+    text = text.strip()
+    for prefix in ("⚡ ", "⚡", "SPARK ", "SPARKS "):
+        if text.startswith(prefix):
+            return text[len(prefix):].strip()
+    return text
+
+
+def render_brand_text(text: str, level: int = 2, sidebar: bool = False) -> None:
+    cleaned_text = strip_brand_prefix(text)
+    logo_path = get_logo_path()
+    text_size = {1: "2.25rem", 2: "1.75rem", 3: "1.35rem"}.get(level, "1.75rem")
+    font_weight = {1: 700, 2: 600, 3: 600}.get(level, 600)
+    margin_bottom = {1: "0.6rem", 2: "0.5rem", 3: "0.35rem"}.get(level, "0.5rem")
+    logo_height = {1: "1.35em", 2: "1.3em", 3: "1.25em"}.get(level, "1.3em")
+
+    if logo_path is not None:
+        encoded_logo = base64.b64encode(logo_path.read_bytes()).decode("ascii")
+        html = (
+            f'<div style="display:flex;align-items:center;gap:0.45rem;margin-bottom:{margin_bottom};">'
+            f'<img src="data:image/png;base64,{encoded_logo}" '
+            f'style="height:{logo_height};width:auto;vertical-align:middle;" alt="SPARK logo">'
+            f'<span style="font-size:{text_size};font-weight:{font_weight};line-height:1.2;">{cleaned_text}</span>'
+            '</div>'
+        )
+    else:
+        html = (
+            f'<div style="display:flex;align-items:center;gap:0.45rem;margin-bottom:{margin_bottom};">'
+            f'<span style="font-size:{text_size};line-height:1;">⚡</span>'
+            f'<span style="font-size:{text_size};font-weight:{font_weight};line-height:1.2;">{cleaned_text}</span>'
+            '</div>'
+        )
+
+    if sidebar:
+        st.sidebar.markdown(html, unsafe_allow_html=True)
+    else:
+        st.markdown(html, unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -41,7 +103,7 @@ DEFAULT_TRAINER_PASSWORD = "sparks2026"
 # --------------------------------------------------------------------------- #
 def trainer_gate() -> bool:
     """Render the sidebar trainer login; return True if unlocked."""
-    st.sidebar.title(scoring.get_sidebar_title())
+    render_brand_text(scoring.get_sidebar_title(), level=3, sidebar=True)
     st.sidebar.caption(scoring.get_sidebar_subtitle())
 
     if st.session_state.get("is_trainer"):
@@ -79,7 +141,7 @@ def render_leaderboard_body() -> None:
     cols = st.columns(3)
     cols[0].metric("🏆 Leader", leader["team"], f'{leader["total_points"]:.0f} pts')
     cols[1].metric("Teams scoring", int((lb["total_points"] > 0).sum()))
-    cols[2].metric("Total points awarded", f'{lb["total_points"].sum():.0f}')
+    cols[2].metric("Leading team points", f'{leader["total_points"]:.0f}')
 
     st.subheader("Standings")
     display = lb.copy()
@@ -105,6 +167,7 @@ def render_leaderboard_body() -> None:
             "Total": st.column_config.ProgressColumn(
                 "Total", format="%d", min_value=0,
                 max_value=float(max(lb["total_points"].max(), 1)),
+                color="green",
             ),
         },
     )
@@ -126,7 +189,7 @@ def live_leaderboard() -> None:
 
 
 def tab_leaderboard() -> None:
-    st.header(scoring.get_dashboard_title())
+    render_brand_text(scoring.get_dashboard_title(), level=2)
     live = st.toggle("Live auto-refresh", value=True, key="live_toggle")
     if live:
         live_leaderboard()
@@ -198,10 +261,20 @@ def tab_score_entry() -> None:
         submitted = st.form_submit_button("💾 Save score", type="primary")
 
     if submitted:
+        # Get trainer name from session
+        trainer_name = st.session_state.get("trainer_name", "Unknown")
+        team_name = teams.set_index("id").loc[team_id, "name"]
+        
         scoring.upsert_score(
             team_id=team_id, scenario_num=int(scen_num), status=status,
             points=points, minutes=None if minutes == 0 else minutes,
             passed=passed, notes=notes,
+        )
+        # Log the score entry to audit trail
+        scoring.log_score_entry(
+            team_id=team_id, team_name=team_name, scenario_num=int(scen_num),
+            status=status, points=points, minutes=None if minutes == 0 else minutes,
+            passed=passed, notes=notes, trainer_name=trainer_name,
         )
         st.success("Saved. The leaderboard updates on its next refresh.")
 
@@ -235,9 +308,11 @@ def tab_scenarios(can_edit: bool) -> None:
         return
 
     st.caption(
-        "Fully editable. Add or delete **rows** with the +/🗑 controls in the table, "
-        "edit any cell, and add or remove **columns** below. "
-        f"The columns **{', '.join(catalog.CORE_COLUMNS)}** drive scoring and can't be removed."
+        "Fully editable. "
+        "**Rows:** click any cell to edit it; use the ➕ button at the bottom of the table to add a row; "
+        "tick the checkbox on the left of a row then press **Delete** (or the 🗑 icon) to remove it. "
+        "**Columns:** use the controls below to add, rename, or remove columns. "
+        f"The columns **{', '.join(catalog.CORE_COLUMNS)}** drive scoring and can't be removed or renamed."
     )
 
     # Keep a working copy in session so column add/remove survives reruns.
@@ -258,8 +333,41 @@ def tab_scenarios(can_edit: bool) -> None:
     # Persist in-table edits immediately so they aren't lost on rerun.
     st.session_state["catalog_df"] = edited
 
+    st.markdown("**Import scenarios from CSV**")
+    with st.expander("📥 Load scenarios from CSV file"):
+        csv_file = st.file_uploader("Choose a CSV file", type=["csv"], key="csv_import")
+        if csv_file is not None:
+            try:
+                imported_df = pd.read_csv(csv_file)
+                # Validate that core columns exist
+                missing = [c for c in catalog.CORE_COLUMNS if c not in imported_df.columns]
+                if missing:
+                    st.error(f"CSV is missing required columns: {', '.join(missing)}")
+                else:
+                    # Merge imported data with existing
+                    merged = edited.copy()
+                    for idx, row in imported_df.iterrows():
+                        num_val = row.get('num')
+                        if num_val is not None and not pd.isna(num_val):
+                            # Check if scenario already exists
+                            existing_mask = merged['num'] == num_val
+                            if existing_mask.any():
+                                row_idx = merged[existing_mask].index[0]
+                                # Update cells with imported values
+                                for col in imported_df.columns:
+                                    if col in merged.columns and pd.notna(row[col]):
+                                        merged.at[row_idx, col] = row[col]
+                            else:
+                                # Add new row
+                                merged = pd.concat([merged, pd.DataFrame([row])], ignore_index=True)
+                    st.session_state["catalog_df"] = merged
+                    st.success(f"Imported {len(imported_df)} scenarios. Review and save below.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error reading CSV: {e}")
+
     st.markdown("**Columns**")
-    cc1, cc2 = st.columns(2)
+    cc1, cc2, cc3 = st.columns(3)
     with cc1:
         new_col = st.text_input("Add a column", placeholder="e.g. build_status")
         if st.button("➕ Add column") and new_col.strip():
@@ -271,6 +379,24 @@ def tab_scenarios(can_edit: bool) -> None:
                 st.session_state["catalog_df"] = edited
                 st.rerun()
     with cc2:
+        renamable = [c for c in edited.columns if c not in catalog.CORE_COLUMNS]
+        if renamable:
+            col_to_rename = st.selectbox("Rename a column", renamable, key="col_rename_sel")
+            new_col_name = st.text_input(
+                "New name", placeholder="Enter new column name", key="col_rename_input"
+            )
+            if st.button("✏️ Rename column") and new_col_name.strip():
+                name = new_col_name.strip()
+                if name == col_to_rename:
+                    st.warning("New name is the same as the current name.")
+                elif name in edited.columns:
+                    st.warning(f"Column '{name}' already exists.")
+                else:
+                    st.session_state["catalog_df"] = edited.rename(columns={col_to_rename: name})
+                    st.rerun()
+        else:
+            st.caption("No renamable columns (all are core columns).")
+    with cc3:
         removable = [c for c in edited.columns if c not in catalog.CORE_COLUMNS]
         if removable:
             col_to_remove = st.selectbox("Remove a column", removable)
@@ -352,7 +478,7 @@ def tab_setup() -> None:
     new_title = st.text_input(
         "Customize the leaderboard heading",
         value=current_title,
-        placeholder="e.g. ⚡ SPARKS PERFORM Week — Live Leaderboard",
+        placeholder="e.g. SPARK PERFORM Week — Live Leaderboard",
         help="This title appears at the top of the leaderboard for all viewers."
     )
     if st.button("Update title"):
@@ -367,7 +493,7 @@ def tab_setup() -> None:
     new_sb_title = st.text_input(
         "Sidebar main title",
         value=sb_title,
-        placeholder="e.g. ⚡ SPARKS Scoreboard",
+        placeholder="e.g. SPARK Scoreboard",
         help="Appears at the top of the sidebar for all viewers."
     )
     new_sb_subtitle = st.text_input(
@@ -418,17 +544,28 @@ def tab_setup() -> None:
     st.subheader("Data")
     all_scores = scoring.get_all_scores()
     lb = scoring.build_leaderboard()
-    d1, d2 = st.columns(2)
+    score_log = scoring.get_score_log()
+    
+    d1, d2, d3 = st.columns(3)
     d1.download_button(
         "⬇️ Download all scores (CSV)",
         data=all_scores.to_csv(index=False).encode("utf-8"),
-        file_name="sparks_scores.csv", mime="text/csv", disabled=all_scores.empty,
+        file_name="spark_scores.csv", mime="text/csv", disabled=all_scores.empty,
     )
     d2.download_button(
         "⬇️ Download leaderboard (CSV)",
         data=lb.to_csv(index=False).encode("utf-8"),
-        file_name="sparks_leaderboard.csv", mime="text/csv", disabled=lb.empty,
+        file_name="spark_leaderboard.csv", mime="text/csv", disabled=lb.empty,
     )
+    d3.download_button(
+        "⬇️ Export score entry log (CSV)",
+        data=score_log.to_csv(index=False).encode("utf-8"),
+        file_name="spark_score_entry_log.csv", mime="text/csv", disabled=score_log.empty,
+    )
+    
+    if not score_log.empty:
+        with st.expander("📋 View score entry audit log"):
+            st.dataframe(score_log, hide_index=True, use_container_width=True)
 
     with st.expander("⚠️ Danger zone — reset all scores"):
         st.write("This permanently clears every recorded score. Teams are kept.")

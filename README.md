@@ -1,4 +1,4 @@
-# ⚡ SPARKS Module 3 — PERFORM Week Live Scoreboard
+# ⚡ SPARK Module 3 — PERFORM Week Live Scoreboard
 
 A simple, live, interactive scoring system + leaderboard for the PERFORM week
 micro-scenarios. Trainers enter reviewer points and completion time; the app
