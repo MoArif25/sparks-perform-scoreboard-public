@@ -16,6 +16,8 @@ Access model
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 from pathlib import Path
 
 import pandas as pd
@@ -374,36 +376,46 @@ def tab_scenarios(can_edit: bool) -> None:
 
     st.markdown("**Import scenarios from CSV**")
     with st.expander("📥 Load scenarios from CSV file"):
-        csv_file = st.file_uploader("Choose a CSV file", type=["csv"], key="csv_import")
+        if "csv_import_nonce" not in st.session_state:
+            st.session_state["csv_import_nonce"] = 0
+        uploader_key = f"csv_import_{st.session_state['csv_import_nonce']}"
+        csv_file = st.file_uploader("Choose a CSV file", type=["csv"], key=uploader_key)
         if csv_file is not None:
-            try:
-                imported_df = pd.read_csv(csv_file)
-                # Validate that core columns exist
-                missing = [c for c in catalog.CORE_COLUMNS if c not in imported_df.columns]
-                if missing:
-                    st.error(f"CSV is missing required columns: {', '.join(missing)}")
+            file_bytes = csv_file.getvalue()
+            file_sig = hashlib.sha256(file_bytes).hexdigest()
+            st.caption("File selected. Click **Import now** to apply exactly once.")
+            if st.button("📥 Import now", key=f"csv_import_btn_{st.session_state['csv_import_nonce']}"):
+                if st.session_state.get("last_csv_import_sig") == file_sig:
+                    st.info("This exact CSV was already imported. No changes applied.")
                 else:
-                    # Merge imported data with existing
-                    merged = edited.copy()
-                    for idx, row in imported_df.iterrows():
-                        num_val = row.get('num')
-                        if num_val is not None and not pd.isna(num_val):
-                            # Check if scenario already exists
-                            existing_mask = merged['num'] == num_val
-                            if existing_mask.any():
-                                row_idx = merged[existing_mask].index[0]
-                                # Update cells with imported values
-                                for col in imported_df.columns:
-                                    if col in merged.columns and pd.notna(row[col]):
-                                        merged.at[row_idx, col] = row[col]
-                            else:
-                                # Add new row
-                                merged = pd.concat([merged, pd.DataFrame([row])], ignore_index=True)
-                    st.session_state["catalog_df"] = merged
-                    st.success(f"Imported {len(imported_df)} scenarios. Review and save below.")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Error reading CSV: {e}")
+                    try:
+                        imported_df = pd.read_csv(io.BytesIO(file_bytes))
+                        # Validate that core columns exist
+                        missing = [c for c in catalog.CORE_COLUMNS if c not in imported_df.columns]
+                        if missing:
+                            st.error(f"CSV is missing required columns: {', '.join(missing)}")
+                        else:
+                            # Merge imported data with existing
+                            merged = edited.copy()
+                            for _, row in imported_df.iterrows():
+                                num_val = row.get("num")
+                                if num_val is None or pd.isna(num_val):
+                                    continue
+                                existing_mask = merged["num"] == num_val
+                                if existing_mask.any():
+                                    row_idx = merged[existing_mask].index[0]
+                                    for col in imported_df.columns:
+                                        if col in merged.columns and pd.notna(row[col]):
+                                            merged.at[row_idx, col] = row[col]
+                                else:
+                                    merged = pd.concat([merged, pd.DataFrame([row])], ignore_index=True)
+                            st.session_state["catalog_df"] = merged
+                            st.session_state["last_csv_import_sig"] = file_sig
+                            st.session_state["csv_import_nonce"] += 1
+                            st.success(f"Imported {len(imported_df)} scenarios. Review and save below.")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Error reading CSV: {e}")
 
     st.markdown("**Columns**")
     cc1, cc2, cc3 = st.columns(3)
@@ -456,7 +468,12 @@ def tab_scenarios(can_edit: bool) -> None:
             else:
                 catalog.save_catalog(edited)
                 scoring.sync_scenarios(catalog.core_scenarios())
+                _cached_leaderboard.clear()
+                # Ensure other tabs (score entry / leaderboard) re-read the
+                # just-saved catalog in the same user interaction.
+                st.session_state.pop("catalog_df", None)
                 st.success("Catalog saved and scoring synced.")
+                st.rerun()
     with b2:
         if st.button("↩️ Reload from file"):
             st.session_state["catalog_df"] = catalog.load_catalog()
