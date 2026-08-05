@@ -15,6 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pandas as pd
 
@@ -30,36 +31,73 @@ _BACKEND: str | None = None  # "pg" or "sqlite", decided once per process
 
 
 def _normalize_pg_url(url: str) -> str:
-    """Convert a Supabase *direct* connection URL into the IPv4-compatible
-    *session pooler* URL. Streamlit Cloud only supports IPv4, while Supabase
-    direct connections (db.<ref>.supabase.co) are IPv6-only, so we rewrite
-    them automatically to avoid 'Cannot assign requested address' errors.
+    """Normalize Supabase URLs for Streamlit Cloud.
 
-    Direct: postgresql://postgres:PWD@db.<ref>.supabase.co:5432/postgres
-    Pooler: postgresql://postgres.<ref>:PWD@<region>.pooler.supabase.com:5432/postgres
+    Preferred: provide the Supabase session pooler URL directly in DATABASE_URL.
+    Optional: if DATABASE_URL is a direct Supabase host (db.<ref>.supabase.co),
+    set SUPABASE_POOLER_REGION so we can rewrite to the pooler host.
     """
-    import re
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
 
-    m = re.match(
-        r"^postgres(?:ql)?://postgres:([^@]+)@db\.([a-z0-9]+)\.supabase\.co:(\d+)/([^?]+)",
-        url,
-    )
-    if not m:
-        return url  # already a pooler URL or some other host -> leave as-is
+    # Already a session pooler URL (recommended on Streamlit Cloud).
+    if host.endswith("pooler.supabase.com"):
+        return _ensure_sslmode_require(url)
 
-    password, ref, port, dbname = m.groups()
+    # Direct host -> rewrite only when region is explicitly provided.
+    if host.startswith("db.") and host.endswith(".supabase.co"):
+        ref = host.split(".")[1] if len(host.split(".")) >= 3 else ""
+        if ref:
+            try:
+                import streamlit as st
+                region = str(st.secrets.get("SUPABASE_POOLER_REGION", "")).strip()
+            except Exception:
+                region = ""
+            if region:
+                user = parsed.username or "postgres"
+                password = parsed.password or ""
+                auth = user
+                if password:
+                    auth = f"{user}:{password}"
+                netloc = f"{auth}@{region}.pooler.supabase.com:{parsed.port or 5432}"
+                rewritten = urlunparse(
+                    (
+                        parsed.scheme or "postgresql",
+                        netloc,
+                        parsed.path or "/postgres",
+                        parsed.params,
+                        parsed.query,
+                        parsed.fragment,
+                    )
+                )
+                return _ensure_sslmode_require(rewritten)
 
-    region = "aws-1-us-east-1"
-    try:
-        import streamlit as st
-        region = str(st.secrets.get("SUPABASE_POOLER_REGION", region))
-    except Exception:
-        pass
+    return _ensure_sslmode_require(url)
 
-    return (
-        f"postgresql://postgres.{ref}:{password}"
-        f"@{region}.pooler.supabase.com:{port}/{dbname}"
-    )
+
+def _ensure_sslmode_require(url: str) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if "sslmode" not in query:
+        query["sslmode"] = "require"
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _postgres_connection_hint(exc: Exception) -> str:
+    msg = str(exc)
+    if "Cannot assign requested address" in msg or "Network is unreachable" in msg:
+        return (
+            "Supabase direct DB host is likely unreachable from Streamlit Cloud. "
+            "Use a Supabase session pooler DATABASE_URL, or set SUPABASE_POOLER_REGION "
+            "so the app can rewrite direct URLs."
+        )
+    if "password authentication failed" in msg:
+        return "Postgres authentication failed. Recheck DATABASE_URL username/password."
+    if "could not translate host name" in msg:
+        return "Postgres host is invalid. Recheck DATABASE_URL host value."
+    if "timeout expired" in msg:
+        return "Postgres connection timed out. Verify network access and Supabase status."
+    return "Verify DATABASE_URL and SUPABASE_POOLER_REGION secrets in Streamlit Cloud."
 
 
 def _get_pg_url() -> str | None:
@@ -101,6 +139,10 @@ def _is_pg() -> bool:
     return _resolve_backend() == "pg"
 
 
+def backend_name() -> str:
+    return _resolve_backend()
+
+
 @contextmanager
 def _connect():
     if _is_pg():
@@ -114,7 +156,11 @@ def _connect():
                 "read from st.secrets. Refusing to fall back to local SQLite."
             )
         import psycopg2
-        conn = psycopg2.connect(pg_url)
+        try:
+            conn = psycopg2.connect(pg_url, connect_timeout=12)
+        except Exception as exc:
+            hint = _postgres_connection_hint(exc)
+            raise RuntimeError(f"Postgres connection failed: {exc}. {hint}") from exc
         conn.autocommit = False
         try:
             yield conn

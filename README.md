@@ -48,6 +48,20 @@ For a public link (e.g. remote teams), deploy free to
 [Streamlit Community Cloud](https://share.streamlit.io) — push this folder to a
 GitHub repo and point it at `app.py`.
 
+### Streamlit Cloud + Supabase secrets
+
+If you use Supabase/Postgres on Streamlit Cloud, set these in app **Secrets**:
+
+- `DATABASE_URL`: your **Supabase session pooler** connection string (recommended)
+- `SUPABASE_POOLER_REGION`: only needed if `DATABASE_URL` is a direct host (`db.<ref>.supabase.co`), example `aws-0-eu-west-1`
+
+The app is configured to use Postgres for persistence. If Postgres cannot be
+reached, the app now shows a clear startup diagnostic in the UI instead of a
+generic crash page.
+
+This deployment is Postgres-only: if `DATABASE_URL` is missing, the app blocks
+startup and tells you exactly what to fix.
+
 > Tip: keep **Score Entry** restricted to trainers' devices and put the
 > **Leaderboard** tab on the room's big screen.
 

@@ -33,9 +33,28 @@ st.set_page_config(
 )
 
 # --- One-time startup: init DB, seed teams, sync catalog -> scoring DB -------- #
-scoring.init_db()
-scoring.ensure_default_teams(10)
-scoring.sync_scenarios(catalog.core_scenarios())
+_startup_error = None
+try:
+    if scoring.backend_name() != "pg":
+        raise RuntimeError(
+            "Postgres backend is required. Set Streamlit secret DATABASE_URL "
+            "to your Supabase session pooler connection string."
+        )
+    scoring.init_db()
+    scoring.ensure_default_teams(10)
+    scoring.sync_scenarios(catalog.core_scenarios())
+except Exception as exc:
+    _startup_error = str(exc)
+
+if _startup_error:
+    st.error("Database startup failed. The app is running, but cannot connect to Postgres.")
+    st.code(_startup_error)
+    st.markdown(
+        "Required Streamlit Cloud secrets:\n"
+        "- `DATABASE_URL` (Supabase session pooler URL recommended)\n"
+        "- `SUPABASE_POOLER_REGION` (needed only if DATABASE_URL uses direct `db.<ref>.supabase.co`)"
+    )
+    st.stop()
 
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 DEFAULT_TRAINER_PASSWORD = "spark2026"
