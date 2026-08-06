@@ -50,9 +50,10 @@ if _startup_error:
     st.error("Database startup failed. The app is running, but cannot connect to Postgres.")
     st.code(_startup_error)
     st.markdown(
-        "Required Streamlit Cloud secrets:\n"
+        "Set one of these Streamlit Cloud secret formats:\n"
         "- `DATABASE_URL` (Supabase session pooler URL recommended)\n"
-        "- `SUPABASE_POOLER_REGION` (needed only if DATABASE_URL uses direct `db.<ref>.supabase.co`)"
+        "- or field-based keys: `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`\n"
+        "- `SUPABASE_POOLER_REGION` is only needed when `DATABASE_URL` uses direct `db.<ref>.supabase.co`"
     )
     st.stop()
 

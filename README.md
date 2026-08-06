@@ -55,6 +55,24 @@ If you use Supabase/Postgres on Streamlit Cloud, set these in app **Secrets**:
 - `DATABASE_URL`: your **Supabase session pooler** connection string (recommended)
 - `SUPABASE_POOLER_REGION`: only needed if `DATABASE_URL` is a direct host (`db.<ref>.supabase.co`), example `aws-0-eu-west-1`
 
+Alternative (field-based) secret format is also supported:
+
+```toml
+PGHOST = "<host>"
+PGPORT = "5432"
+PGDATABASE = "postgres"
+PGUSER = "<user>"
+PGPASSWORD = "<password>"
+```
+
+Quick template for a full URL (recommended):
+
+```toml
+DATABASE_URL = "postgresql://<user>:<password>@<region>.pooler.supabase.com:5432/postgres?sslmode=require"
+```
+
+If your password contains special characters (`@`, `:`, `/`, `#`, etc.), prefer the field-based format above so encoding is handled safely.
+
 The app is configured to use Postgres for persistence. If Postgres cannot be
 reached, the app now shows a clear startup diagnostic in the UI instead of a
 generic crash page.

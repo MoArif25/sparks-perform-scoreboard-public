@@ -11,11 +11,12 @@ from ? (SQLite) to %s (Postgres) automatically in _execute / _fetchone.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import pandas as pd
 
@@ -28,6 +29,94 @@ STATUS_OPTIONS = ["Not Started", "In Progress", "Submitted", "Reviewed"]
 
 _PG_URL: str | None = None
 _BACKEND: str | None = None  # "pg" or "sqlite", decided once per process
+
+
+def _build_pg_url_from_parts(
+    host: str,
+    port: str | int | None,
+    dbname: str,
+    user: str,
+    password: str,
+) -> str:
+    """Build a URL-safe Postgres DSN from discrete connection fields."""
+    safe_user = quote(str(user), safe="")
+    safe_password = quote(str(password), safe="")
+    port_part = f":{port}" if str(port or "").strip() else ""
+    safe_db = quote(str(dbname), safe="")
+    return f"postgresql://{safe_user}:{safe_password}@{host}{port_part}/{safe_db}"
+
+
+def _first_non_empty(values: Iterable[object]) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _assemble_pg_url_from_fields(secret_lookup, env_lookup) -> str | None:
+    """Build DATABASE_URL from common field-based secret names.
+
+    Supports both generic PG* and Supabase-style keys.
+    """
+    host = _first_non_empty(
+        [
+            secret_lookup("PGHOST"),
+            secret_lookup("POSTGRES_HOST"),
+            secret_lookup("SUPABASE_DB_HOST"),
+            env_lookup("PGHOST"),
+            env_lookup("POSTGRES_HOST"),
+            env_lookup("SUPABASE_DB_HOST"),
+        ]
+    )
+    port = _first_non_empty(
+        [
+            secret_lookup("PGPORT"),
+            secret_lookup("POSTGRES_PORT"),
+            secret_lookup("SUPABASE_DB_PORT"),
+            env_lookup("PGPORT"),
+            env_lookup("POSTGRES_PORT"),
+            env_lookup("SUPABASE_DB_PORT"),
+            "5432",
+        ]
+    )
+    dbname = _first_non_empty(
+        [
+            secret_lookup("PGDATABASE"),
+            secret_lookup("POSTGRES_DB"),
+            secret_lookup("SUPABASE_DB_NAME"),
+            env_lookup("PGDATABASE"),
+            env_lookup("POSTGRES_DB"),
+            env_lookup("SUPABASE_DB_NAME"),
+            "postgres",
+        ]
+    )
+    user = _first_non_empty(
+        [
+            secret_lookup("PGUSER"),
+            secret_lookup("POSTGRES_USER"),
+            secret_lookup("SUPABASE_DB_USER"),
+            env_lookup("PGUSER"),
+            env_lookup("POSTGRES_USER"),
+            env_lookup("SUPABASE_DB_USER"),
+        ]
+    )
+    password = _first_non_empty(
+        [
+            secret_lookup("PGPASSWORD"),
+            secret_lookup("POSTGRES_PASSWORD"),
+            secret_lookup("SUPABASE_DB_PASSWORD"),
+            env_lookup("PGPASSWORD"),
+            env_lookup("POSTGRES_PASSWORD"),
+            env_lookup("SUPABASE_DB_PASSWORD"),
+        ]
+    )
+
+    if host and user and password:
+        return _build_pg_url_from_parts(host, port, dbname or "postgres", user, password)
+    return None
 
 
 def _normalize_pg_url(url: str) -> str:
@@ -104,15 +193,57 @@ def _get_pg_url() -> str | None:
     global _PG_URL, _BACKEND
     if _PG_URL is not None:
         return _PG_URL
+
+    # First, trust explicit environment variables if provided.
+    env_url = _first_non_empty([
+        os.getenv("DATABASE_URL"),
+        os.getenv("POSTGRES_URL"),
+        os.getenv("SUPABASE_DB_URL"),
+        os.getenv("SUPABASE_DATABASE_URL"),
+    ])
+    if env_url:
+        _PG_URL = _normalize_pg_url(env_url)
+        _BACKEND = "pg"
+        return _PG_URL
+
+    def _env_lookup(key: str):
+        return os.getenv(key)
+
+    def _secret_lookup(_key: str):
+        return None
+
     try:
         import streamlit as st
-        url = st.secrets.get("DATABASE_URL")
+        def _secret_lookup(key: str):
+            return st.secrets.get(key)
+
+        url = _first_non_empty([
+            st.secrets.get("DATABASE_URL"),
+            st.secrets.get("POSTGRES_URL"),
+            st.secrets.get("SUPABASE_DB_URL"),
+            st.secrets.get("SUPABASE_DATABASE_URL"),
+            os.getenv("DATABASE_URL"),
+            os.getenv("POSTGRES_URL"),
+            os.getenv("SUPABASE_DB_URL"),
+            os.getenv("SUPABASE_DATABASE_URL"),
+        ])
+        if not url:
+            url = _assemble_pg_url_from_fields(_secret_lookup, _env_lookup)
+
         if url:
             _PG_URL = _normalize_pg_url(str(url))
             _BACKEND = "pg"
             return _PG_URL
     except Exception:
         pass
+
+    # Last attempt: assemble from environment variables only.
+    url = _assemble_pg_url_from_fields(_secret_lookup, _env_lookup)
+    if url:
+        _PG_URL = _normalize_pg_url(url)
+        _BACKEND = "pg"
+        return _PG_URL
+
     return None
 
 
