@@ -55,6 +55,8 @@ if _startup_error:
         "- or field-based keys: `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`\n"
         "- `SUPABASE_POOLER_REGION` is only needed when `DATABASE_URL` uses direct `db.<ref>.supabase.co`"
     )
+    with st.expander("🔎 Secret detection diagnostics (safe — shows key names only)"):
+        st.json(scoring.secret_diagnostics())
     st.stop()
 
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}

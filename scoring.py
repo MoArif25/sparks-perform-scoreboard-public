@@ -247,6 +247,50 @@ def _get_pg_url() -> str | None:
     return None
 
 
+def secret_diagnostics() -> dict:
+    """Return non-sensitive info about which DB config keys are visible.
+
+    Only reports key NAMES (never values) so it is safe to render in the UI
+    when startup fails, helping diagnose Streamlit Cloud secret problems.
+    """
+    known_keys = [
+        "DATABASE_URL", "POSTGRES_URL", "SUPABASE_DB_URL", "SUPABASE_DATABASE_URL",
+        "PGHOST", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD",
+        "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD",
+        "SUPABASE_DB_HOST", "SUPABASE_DB_PORT", "SUPABASE_DB_NAME",
+        "SUPABASE_DB_USER", "SUPABASE_DB_PASSWORD",
+    ]
+    secret_keys_present: list[str] = []
+    all_secret_key_names: list[str] = []
+    secrets_readable = False
+    secrets_error = ""
+    try:
+        import streamlit as st
+        try:
+            all_secret_key_names = sorted(list(st.secrets.keys()))
+            secrets_readable = True
+        except Exception as exc:  # noqa: BLE001
+            secrets_error = str(exc)
+        for k in known_keys:
+            try:
+                if str(st.secrets.get(k) or "").strip():
+                    secret_keys_present.append(k)
+            except Exception:
+                pass
+    except Exception as exc:  # noqa: BLE001
+        secrets_error = str(exc)
+
+    env_keys_present = [k for k in known_keys if str(os.getenv(k) or "").strip()]
+
+    return {
+        "secrets_readable": secrets_readable,
+        "secrets_error": secrets_error,
+        "all_secret_top_level_keys": all_secret_key_names,
+        "recognized_secret_keys": secret_keys_present,
+        "recognized_env_keys": env_keys_present,
+    }
+
+
 def _resolve_backend() -> str:
     """Decide ONCE whether this process talks to Postgres or SQLite, and keep
     that decision sticky for the whole process.
