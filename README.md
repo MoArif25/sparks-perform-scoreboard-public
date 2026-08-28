@@ -9,24 +9,49 @@ or accounts required.
 ## Who sees what
 
 - **Leaderboard:** public — participants, trainers and core team all watch it
-  live (projector or their own phones). A read-only scenario catalog is also
-  public.
-- **Score Entry, Scenario editing, Setup:** locked behind a **trainer password**
-  (sidebar login). Default password is `sparks2026` — change it in Setup.
+  live (projector or their own phones). A read-only scenario catalog and the
+  team **Submit Work** form are also public.
+- **Submissions inbox, Score Entry, Scenario editing, Setup:** locked behind a
+  **trainer password** (sidebar login). Default password is `spark2026` — change
+  it in Setup. Trainers also enter their name at login, which is recorded
+  against every score in the audit log.
 
 ## How it works
 
-- **Score Entry (trainers):** pick a team + scenario, enter points, time taken,
-  and whether the solution passed. Save.
+- **Submit Work (teams):** a team picks itself and a scenario, answers the
+  scenario questions (if any have been authored), writes a short summary,
+  optionally attaches evidence files, and self-reports the points it believes it
+  earned. **One submission per team per scenario.** After submitting, the team
+  sees *"Submitted — pending trainer review"*.
+- **Submissions inbox (trainers):** review a submission, download its evidence,
+  then **Accept** to post points to the leaderboard, **Reopen** to let the team
+  resubmit, or **Void** it. Accepting writes to the same score table the manual
+  form uses, so the leaderboard is unchanged.
+- **Score Entry (trainers):** unchanged manual path — pick a team + scenario,
+  enter points, time taken, and whether the solution passed. Still available as
+  a fallback alongside the submission flow.
 - **Speed bonus:** in each scenario, the fastest *passing* teams get bonus
   points (default `5, 3, 2, 1` for the top four). Configurable in **Setup**.
+  Submissions do not record time, so accepted submissions earn no speed bonus.
 - **Leaderboard:** `Total = reviewer points + speed bonus`. Ties broken by total
-  time (faster wins). Auto-refreshes every 5 seconds — great for a projector.
+  time (faster wins). Auto-refreshes every 15 seconds — great for a projector.
+
+### Scenario questions (sub-scenarios)
+
+Scenarios can optionally carry a list of questions in the `scenario_items`
+table. When a scenario has none, the submission form falls back to a single
+free-text summary. When questions are added later, the form renders them
+automatically — no code change needed. Each item already carries dormant
+`verify_type` / `verify_config` columns for automatic grading in a later step.
+
+Evidence files are stored inline in Postgres (Streamlit Cloud's filesystem is
+ephemeral), capped at 5 MB per file and 4 files per submission.
+
 - **Submissions** of the actual work stay in SharePoint/Teams as usual; this app
   only tracks scoring + ranking.
 
-All data lives in a single `sparks.db` file next to the app — back it up by
-copying that file, reset it by deleting it (or use the Setup → reset button).
+All data lives in Postgres (Supabase) for the deployed app. Local development
+without `DATABASE_URL` falls back to a `sparks.db` SQLite file next to the app.
 
 ## Run locally
 

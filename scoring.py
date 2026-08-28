@@ -27,6 +27,14 @@ DB_PATH = Path(__file__).with_name("sparks.db")
 DEFAULT_TIME_BONUS_TABLE = [5, 3, 2, 1]
 STATUS_OPTIONS = ["Not Started", "In Progress", "Submitted", "Reviewed"]
 
+# Team submission pipeline
+SUBMISSION_STATUSES = ["submitted", "accepted", "reopened", "void"]
+ITEM_TYPES = ["text", "long_text", "number", "choice", "multi_choice", "checkbox"]
+# Evidence is stored inline in Postgres, so keep uploads small: Streamlit Cloud
+# has an ephemeral filesystem and Supabase free tier caps total DB size.
+MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_FILES_PER_SUBMISSION = 4
+
 _PG_URL: str | None = None
 _BACKEND: str | None = None  # "pg" or "sqlite", decided once per process
 
@@ -378,6 +386,28 @@ def _fetchone(conn, sql: str, params=()):
         return dict(row) if row else None
 
 
+def _fetchall(conn, sql: str, params=()) -> list[dict]:
+    if _is_pg():
+        cur = conn.cursor()
+        cur.execute(sql.replace("?", "%s"), params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def _insert_returning_id(conn, sql: str, params=()) -> int:
+    """Insert one row and return its generated primary key on both backends."""
+    if _is_pg():
+        cur = conn.cursor()
+        cur.execute(sql.replace("?", "%s") + " RETURNING id", params)
+        return int(cur.fetchone()[0])
+    return int(conn.execute(sql, params).lastrowid)
+
+
+def _now_sql() -> str:
+    return "NOW()" if _is_pg() else "datetime('now')"
+
+
 def _read_sql(sql: str, conn) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn)
 
@@ -438,6 +468,58 @@ def init_db() -> None:
                     logged_at    TIMESTAMPTZ DEFAULT NOW(),
                     FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
                 )""",
+                """CREATE TABLE IF NOT EXISTS scenario_items (
+                    id            SERIAL PRIMARY KEY,
+                    scenario_num  INTEGER NOT NULL,
+                    sort_order    INTEGER NOT NULL DEFAULT 0,
+                    label         TEXT NOT NULL,
+                    item_type     TEXT NOT NULL DEFAULT 'text',
+                    options       TEXT,
+                    max_points    REAL,
+                    required      INTEGER NOT NULL DEFAULT 0,
+                    verify_type   TEXT NOT NULL DEFAULT 'manual',
+                    verify_config TEXT
+                )""",
+                """CREATE TABLE IF NOT EXISTS submissions (
+                    id             SERIAL PRIMARY KEY,
+                    team_id        INTEGER NOT NULL,
+                    scenario_num   INTEGER NOT NULL,
+                    attempt_no     INTEGER NOT NULL DEFAULT 1,
+                    status         TEXT NOT NULL DEFAULT 'submitted',
+                    summary        TEXT,
+                    self_completed INTEGER NOT NULL DEFAULT 0,
+                    self_points    REAL,
+                    auto_points    REAL,
+                    final_points   REAL,
+                    submitted_by   TEXT,
+                    submitted_at   TIMESTAMPTZ DEFAULT NOW(),
+                    reviewed_by    TEXT,
+                    reviewed_at    TIMESTAMPTZ,
+                    review_notes   TEXT,
+                    UNIQUE (team_id, scenario_num),
+                    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+                )""",
+                """CREATE TABLE IF NOT EXISTS submission_answers (
+                    id             SERIAL PRIMARY KEY,
+                    submission_id  INTEGER NOT NULL,
+                    item_id        INTEGER,
+                    label          TEXT,
+                    answer_text    TEXT,
+                    answer_number  REAL,
+                    awarded_points REAL,
+                    auto_result    TEXT,
+                    FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+                )""",
+                """CREATE TABLE IF NOT EXISTS submission_files (
+                    id            SERIAL PRIMARY KEY,
+                    submission_id INTEGER NOT NULL,
+                    filename      TEXT NOT NULL,
+                    mime_type     TEXT,
+                    byte_size     INTEGER NOT NULL,
+                    content       BYTEA NOT NULL,
+                    uploaded_at   TIMESTAMPTZ DEFAULT NOW(),
+                    FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+                )""",
             ]
             for stmt in stmts:
                 _execute(conn, stmt)
@@ -491,6 +573,58 @@ def init_db() -> None:
                     trainer_name TEXT NOT NULL,
                     logged_at    TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS scenario_items (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_num  INTEGER NOT NULL,
+                    sort_order    INTEGER NOT NULL DEFAULT 0,
+                    label         TEXT NOT NULL,
+                    item_type     TEXT NOT NULL DEFAULT 'text',
+                    options       TEXT,
+                    max_points    REAL,
+                    required      INTEGER NOT NULL DEFAULT 0,
+                    verify_type   TEXT NOT NULL DEFAULT 'manual',
+                    verify_config TEXT
+                );
+                CREATE TABLE IF NOT EXISTS submissions (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id        INTEGER NOT NULL,
+                    scenario_num   INTEGER NOT NULL,
+                    attempt_no     INTEGER NOT NULL DEFAULT 1,
+                    status         TEXT NOT NULL DEFAULT 'submitted',
+                    summary        TEXT,
+                    self_completed INTEGER NOT NULL DEFAULT 0,
+                    self_points    REAL,
+                    auto_points    REAL,
+                    final_points   REAL,
+                    submitted_by   TEXT,
+                    submitted_at   TEXT DEFAULT (datetime('now')),
+                    reviewed_by    TEXT,
+                    reviewed_at    TEXT,
+                    review_notes   TEXT,
+                    UNIQUE (team_id, scenario_num),
+                    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS submission_answers (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id  INTEGER NOT NULL,
+                    item_id        INTEGER,
+                    label          TEXT,
+                    answer_text    TEXT,
+                    answer_number  REAL,
+                    awarded_points REAL,
+                    auto_result    TEXT,
+                    FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS submission_files (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id INTEGER NOT NULL,
+                    filename      TEXT NOT NULL,
+                    mime_type     TEXT,
+                    byte_size     INTEGER NOT NULL,
+                    content       BLOB NOT NULL,
+                    uploaded_at   TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE
                 );
                 """
             )
@@ -797,6 +931,218 @@ def get_score_log() -> pd.DataFrame:
                FROM score_log
                ORDER BY id DESC""",
             conn)
+
+
+# ---------------------------------------------------------------------------
+# Scenario items (sub-scenario questions)
+# ---------------------------------------------------------------------------
+def get_scenario_items(scenario_num: int) -> pd.DataFrame:
+    """Questions defined for one scenario. Empty until items are authored."""
+    with _connect() as conn:
+        return _read_sql(
+            "SELECT id, scenario_num, sort_order, label, item_type, options, "
+            "       max_points, required, verify_type, verify_config "
+            f"FROM scenario_items WHERE scenario_num = {int(scenario_num)} "
+            "ORDER BY sort_order, id",
+            conn)
+
+
+def count_scenario_items() -> int:
+    with _connect() as conn:
+        row = _fetchone(conn, "SELECT COUNT(*) AS n FROM scenario_items")
+    return int(row["n"]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Team submissions
+# ---------------------------------------------------------------------------
+def get_submission_for(team_id: int, scenario_num: int) -> dict | None:
+    with _connect() as conn:
+        return _fetchone(conn,
+            "SELECT * FROM submissions WHERE team_id=? AND scenario_num=?",
+            (team_id, scenario_num))
+
+
+def save_submission(
+    team_id: int,
+    scenario_num: int,
+    summary: str | None,
+    self_completed: bool,
+    self_points: float | None,
+    submitted_by: str | None,
+    answers: list[dict],
+    files: list[dict],
+) -> int:
+    """Create the team's submission, or replace it if a trainer reopened it.
+
+    ``answers`` items carry ``item_id``, ``label``, ``answer_text`` and
+    ``answer_number``. ``files`` items carry ``filename``, ``mime_type`` and
+    ``content`` (bytes).
+    """
+    now = _now_sql()
+    with _connect() as conn:
+        existing = _fetchone(conn,
+            "SELECT id, attempt_no, status FROM submissions "
+            "WHERE team_id=? AND scenario_num=?",
+            (team_id, scenario_num))
+
+        if existing is None:
+            sub_id = _insert_returning_id(conn,
+                "INSERT INTO submissions "
+                "(team_id, scenario_num, attempt_no, status, summary, "
+                " self_completed, self_points, submitted_by, submitted_at) "
+                f"VALUES (?, ?, 1, 'submitted', ?, ?, ?, ?, {now})",
+                (team_id, scenario_num, summary,
+                 1 if self_completed else 0, self_points, submitted_by))
+        else:
+            if existing["status"] in ("submitted", "accepted"):
+                raise ValueError("This team has already submitted this scenario.")
+            sub_id = int(existing["id"])
+            _execute(conn,
+                "UPDATE submissions SET attempt_no=?, status='submitted', summary=?, "
+                "self_completed=?, self_points=?, submitted_by=?, "
+                f"submitted_at={now}, reviewed_by=NULL, reviewed_at=NULL, "
+                "review_notes=NULL, final_points=NULL WHERE id=?",
+                (int(existing["attempt_no"]) + 1, summary,
+                 1 if self_completed else 0, self_points, submitted_by, sub_id))
+            _execute(conn, "DELETE FROM submission_answers WHERE submission_id=?", (sub_id,))
+            _execute(conn, "DELETE FROM submission_files WHERE submission_id=?", (sub_id,))
+
+        for a in answers:
+            _execute(conn,
+                "INSERT INTO submission_answers "
+                "(submission_id, item_id, label, answer_text, answer_number) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sub_id, a.get("item_id"), a.get("label"),
+                 a.get("answer_text"), a.get("answer_number")))
+
+        for f in files:
+            content = f["content"]
+            _execute(conn,
+                "INSERT INTO submission_files "
+                "(submission_id, filename, mime_type, byte_size, content) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sub_id, f["filename"], f.get("mime_type"), len(content),
+                 memoryview(content) if _is_pg() else content))
+
+    return sub_id
+
+
+def get_submissions_overview() -> pd.DataFrame:
+    with _connect() as conn:
+        return _read_sql(
+            """SELECT s.id, t.name AS team, s.team_id, s.scenario_num,
+                      COALESCE(sc.title,
+                               'Scenario #' || CAST(s.scenario_num AS TEXT)) AS scenario,
+                      s.status, s.attempt_no, s.self_completed, s.self_points,
+                      s.final_points, s.reviewed_by,
+                      COALESCE(sc.max_points, 0) AS max_points,
+                      CAST(s.submitted_at AS TEXT) AS submitted_at,
+                      (SELECT COUNT(*) FROM submission_files f
+                        WHERE f.submission_id = s.id) AS files
+               FROM submissions s
+               JOIN teams t           ON t.id = s.team_id
+               LEFT JOIN scenarios sc ON sc.num = s.scenario_num
+               ORDER BY s.submitted_at DESC, s.id DESC""",
+            conn)
+
+
+def get_submission(submission_id: int) -> dict | None:
+    with _connect() as conn:
+        return _fetchone(conn,
+            """SELECT s.*, t.name AS team,
+                      COALESCE(sc.title,
+                               'Scenario #' || CAST(s.scenario_num AS TEXT)) AS scenario,
+                      COALESCE(sc.max_points, 0) AS max_points
+               FROM submissions s
+               JOIN teams t           ON t.id = s.team_id
+               LEFT JOIN scenarios sc ON sc.num = s.scenario_num
+               WHERE s.id=?""",
+            (submission_id,))
+
+
+def get_submission_answers(submission_id: int) -> pd.DataFrame:
+    with _connect() as conn:
+        return _read_sql(
+            "SELECT id, item_id, label, answer_text, answer_number, "
+            "       awarded_points, auto_result "
+            f"FROM submission_answers WHERE submission_id = {int(submission_id)} "
+            "ORDER BY id",
+            conn)
+
+
+def list_submission_files(submission_id: int) -> list[dict]:
+    """File metadata only — blobs are fetched on demand by get_file_content."""
+    with _connect() as conn:
+        return _fetchall(conn,
+            "SELECT id, filename, mime_type, byte_size FROM submission_files "
+            "WHERE submission_id=? ORDER BY id",
+            (submission_id,))
+
+
+def get_file_content(file_id: int) -> tuple[str, str, bytes] | None:
+    with _connect() as conn:
+        row = _fetchone(conn,
+            "SELECT filename, mime_type, content FROM submission_files WHERE id=?",
+            (file_id,))
+    if not row:
+        return None
+    content = row["content"]
+    if isinstance(content, memoryview):
+        content = content.tobytes()
+    return row["filename"], row["mime_type"] or "application/octet-stream", bytes(content)
+
+
+def accept_submission(
+    submission_id: int,
+    final_points: float,
+    reviewer: str,
+    notes: str | None = None,
+) -> None:
+    """Approve a submission and push the awarded points into the leaderboard."""
+    sub = get_submission(submission_id)
+    if sub is None:
+        raise ValueError(f"Submission {submission_id} not found.")
+
+    upsert_score(
+        team_id=int(sub["team_id"]),
+        scenario_num=int(sub["scenario_num"]),
+        status="Reviewed",
+        points=float(final_points),
+        minutes=None,
+        passed=float(final_points) > 0,
+        notes=notes,
+    )
+    log_score_entry(
+        team_id=int(sub["team_id"]),
+        team_name=str(sub["team"]),
+        scenario_num=int(sub["scenario_num"]),
+        status="Reviewed",
+        points=float(final_points),
+        minutes=None,
+        passed=float(final_points) > 0,
+        notes=notes,
+        trainer_name=reviewer,
+    )
+
+    now = _now_sql()
+    with _connect() as conn:
+        _execute(conn,
+            "UPDATE submissions SET status='accepted', final_points=?, "
+            f"reviewed_by=?, reviewed_at={now}, review_notes=? WHERE id=?",
+            (float(final_points), reviewer, notes, submission_id))
+
+
+def set_submission_status(submission_id: int, status: str, reviewer: str) -> None:
+    """Reopen a submission for resubmission, or void it."""
+    if status not in ("reopened", "void"):
+        raise ValueError(f"Unsupported status: {status}")
+    now = _now_sql()
+    with _connect() as conn:
+        _execute(conn,
+            "UPDATE submissions SET status=?, reviewed_by=?, "
+            f"reviewed_at={now} WHERE id=?",
+            (status, reviewer, submission_id))
 
 
 # ---------------------------------------------------------------------------

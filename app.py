@@ -131,19 +131,25 @@ def trainer_gate() -> bool:
     st.sidebar.caption(scoring.get_sidebar_subtitle())
 
     if st.session_state.get("is_trainer"):
-        st.sidebar.success("Trainer / Core team mode")
+        st.sidebar.success(f"Trainer / Core team mode — {st.session_state.get('trainer_name', 'Unknown')}")
         if st.sidebar.button("🔒 Log out"):
             st.session_state["is_trainer"] = False
+            st.session_state.pop("trainer_name", None)
             st.rerun()
         return True
 
     st.sidebar.info("👀 Viewing the public leaderboard.")
     with st.sidebar.expander("🔑 Trainer / Core team login"):
+        name = st.text_input("Your name", key="trainer_name_input",
+                             placeholder="Used in the score audit log")
         pwd = st.text_input("Password", type="password", key="pwd_input")
         if st.button("Unlock"):
             real = scoring.get_setting("trainer_password", DEFAULT_TRAINER_PASSWORD)
-            if pwd == real:
+            if not name.strip():
+                st.error("Please enter your name.")
+            elif pwd == real:
                 st.session_state["is_trainer"] = True
+                st.session_state["trainer_name"] = name.strip()
                 st.rerun()
             else:
                 st.error("Incorrect password.")
@@ -356,6 +362,305 @@ def tab_score_entry() -> None:
             file_name="spark_score_entry_log.csv",
             mime="text/csv",
         )
+
+
+# --------------------------------------------------------------------------- #
+# Team submission form (public)
+# --------------------------------------------------------------------------- #
+def _parse_options(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    separator = "|" if "|" in raw else "\n"
+    return [o.strip() for o in str(raw).split(separator) if o.strip()]
+
+
+def _render_item(item: pd.Series) -> dict:
+    """Render one sub-scenario question and return its answer row."""
+    label = str(item["label"])
+    item_type = str(item["item_type"] or "text")
+    key = f"item_{int(item['id'])}"
+    required = bool(item["required"])
+    display = f"{label} *" if required else label
+    if pd.notna(item["max_points"]):
+        display += f"  ·  {float(item['max_points']):g} pts"
+
+    answer = {"item_id": int(item["id"]), "label": label,
+              "answer_text": None, "answer_number": None}
+
+    if item_type == "long_text":
+        answer["answer_text"] = st.text_area(display, key=key)
+    elif item_type == "number":
+        answer["answer_number"] = st.number_input(display, value=0.0, step=1.0, key=key)
+    elif item_type == "choice":
+        options = _parse_options(item["options"])
+        if options:
+            answer["answer_text"] = st.radio(display, options, key=key)
+        else:
+            answer["answer_text"] = st.text_input(display, key=key)
+    elif item_type == "multi_choice":
+        options = _parse_options(item["options"])
+        picked = st.multiselect(display, options, key=key) if options else []
+        answer["answer_text"] = ", ".join(picked)
+    elif item_type == "checkbox":
+        answer["answer_text"] = "Yes" if st.checkbox(display, key=key) else "No"
+    else:
+        answer["answer_text"] = st.text_input(display, key=key)
+
+    return answer
+
+
+def tab_submit() -> None:
+    st.header("📤 Submit Your Work")
+    teams = scoring.get_teams()
+    scen = catalog.core_scenarios()
+
+    if teams.empty:
+        st.warning("No teams have been set up yet.")
+        return
+    if scen.empty:
+        st.warning("No scenarios have been set up yet.")
+        return
+
+    scen_lookup = scen.set_index("num")
+    c1, c2 = st.columns(2)
+    team_id = int(c1.selectbox(
+        "Your team",
+        options=teams["id"].tolist(),
+        format_func=lambda i: teams.set_index("id").loc[i, "name"],
+        key="submit_team",
+    ))
+    scen_num = int(c2.selectbox(
+        "Scenario",
+        options=scen["num"].tolist(),
+        format_func=lambda n: f'#{n} — {scen_lookup.loc[n, "title"]}',
+        key="submit_scenario",
+    ))
+
+    max_points = int(scen_lookup.loc[scen_num, "max_points"])
+    scoring_text = scen_lookup.loc[scen_num, "scoring"]
+    st.caption(f"Max points: **{max_points}** · Scoring: *{scoring_text}*")
+
+    existing = scoring.get_submission_for(team_id, scen_num)
+    if existing and existing["status"] == "submitted":
+        st.success("✅ Submitted — pending trainer review.")
+        st.caption("Each team submits once per scenario. Ask a trainer if you need to change it.")
+        return
+    if existing and existing["status"] == "accepted":
+        st.success("🏅 Reviewed and scored.")
+        st.metric("Points awarded", f'{float(existing["final_points"] or 0):.0f}')
+        return
+    if existing and existing["status"] == "void":
+        st.error("This submission was voided by a trainer. Please speak to your trainer.")
+        return
+    if existing and existing["status"] == "reopened":
+        st.info("🔄 A trainer reopened this scenario — you can submit again below.")
+
+    items = scoring.get_scenario_items(scen_num)
+
+    with st.form(f"submit_form_{team_id}_{scen_num}", clear_on_submit=False):
+        answers: list[dict] = []
+
+        if items.empty:
+            st.markdown("**What did your team do?**")
+            summary = st.text_area(
+                "Describe your approach, what you configured, and the result",
+                height=180,
+            )
+        else:
+            st.markdown("**Scenario questions**")
+            for _, item in items.iterrows():
+                answers.append(_render_item(item))
+            st.divider()
+            summary = st.text_area("Anything else the reviewer should know? (optional)")
+
+        st.divider()
+        st.markdown("**Evidence (optional)**")
+        uploads = st.file_uploader(
+            f"Screenshots, config exports, output files — max {scoring.MAX_FILES_PER_SUBMISSION} "
+            f"files, {scoring.MAX_FILE_BYTES // (1024 * 1024)} MB each",
+            accept_multiple_files=True,
+        )
+
+        st.divider()
+        sc1, sc2 = st.columns(2)
+        self_completed = sc1.checkbox("We completed this scenario in full")
+        self_points = sc2.number_input(
+            "Points you believe you earned", min_value=0, max_value=max_points,
+            value=0, step=1,
+            help="A trainer confirms or adjusts this during review.",
+        )
+        submitted_by = st.text_input("Submitted by (optional)", placeholder="Your name")
+
+        send = st.form_submit_button("📤 Submit", type="primary")
+
+    if not send:
+        return
+
+    uploads = uploads or []
+    if len(uploads) > scoring.MAX_FILES_PER_SUBMISSION:
+        st.error(f"Please attach at most {scoring.MAX_FILES_PER_SUBMISSION} files.")
+        return
+
+    files = []
+    for upload in uploads:
+        data = upload.getvalue()
+        if len(data) > scoring.MAX_FILE_BYTES:
+            st.error(
+                f"'{upload.name}' is {len(data) / (1024 * 1024):.1f} MB — the limit is "
+                f"{scoring.MAX_FILE_BYTES // (1024 * 1024)} MB per file."
+            )
+            return
+        files.append({"filename": upload.name, "mime_type": upload.type, "content": data})
+
+    missing = [
+        a["label"] for a, (_, item) in zip(answers, items.iterrows())
+        if bool(item["required"]) and not str(a["answer_text"] or "").strip()
+        and a["answer_number"] is None
+    ]
+    if missing:
+        st.error("Please answer the required questions: " + ", ".join(missing))
+        return
+
+    if items.empty and not str(summary or "").strip():
+        st.error("Please describe what your team did before submitting.")
+        return
+
+    try:
+        scoring.save_submission(
+            team_id=team_id,
+            scenario_num=scen_num,
+            summary=summary,
+            self_completed=self_completed,
+            self_points=float(self_points),
+            submitted_by=submitted_by.strip() or None,
+            answers=answers,
+            files=files,
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    st.success("✅ Submitted — pending trainer review.")
+    st.balloons()
+    st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+# Submissions inbox (trainers only)
+# --------------------------------------------------------------------------- #
+def tab_submissions() -> None:
+    st.header("📥 Submissions Inbox")
+    subs = scoring.get_submissions_overview()
+
+    if subs.empty:
+        st.info("No submissions yet. Teams submit from the **Submit Work** tab.")
+        return
+
+    pending = int((subs["status"] == "submitted").sum())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Awaiting review", pending)
+    m2.metric("Accepted", int((subs["status"] == "accepted").sum()))
+    m3.metric("Total submissions", len(subs))
+
+    status_filter = st.multiselect(
+        "Show", scoring.SUBMISSION_STATUSES, default=["submitted", "reopened"],
+    )
+    view = subs[subs["status"].isin(status_filter)] if status_filter else subs
+
+    st.dataframe(
+        view[["id", "team", "scenario_num", "scenario", "status", "self_completed",
+              "self_points", "final_points", "files", "submitted_at"]].rename(
+            columns={"id": "ID", "team": "Team", "scenario_num": "#",
+                     "scenario": "Scenario", "status": "Status",
+                     "self_completed": "Self-complete", "self_points": "Self pts",
+                     "final_points": "Awarded", "files": "Files",
+                     "submitted_at": "Submitted"}),
+        hide_index=True, use_container_width=True,
+    )
+
+    if view.empty:
+        return
+
+    st.divider()
+    st.subheader("Review a submission")
+    sub_id = int(st.selectbox(
+        "Submission",
+        options=view["id"].tolist(),
+        format_func=lambda i: (
+            f'#{i} · {view.set_index("id").loc[i, "team"]} · '
+            f'{view.set_index("id").loc[i, "scenario"]}'
+        ),
+    ))
+
+    sub = scoring.get_submission(sub_id)
+    if sub is None:
+        st.error("Submission not found.")
+        return
+
+    max_points = int(sub["max_points"] or 0)
+    i1, i2, i3 = st.columns(3)
+    i1.metric("Team", sub["team"])
+    i2.metric("Self-reported", f'{float(sub["self_points"] or 0):.0f} / {max_points}')
+    i3.metric("Attempt", int(sub["attempt_no"]))
+    st.caption(
+        f'Status: **{sub["status"]}** · Submitted: {sub["submitted_at"]}'
+        + (f' · by {sub["submitted_by"]}' if sub["submitted_by"] else "")
+        + (" · ✅ team marked complete" if sub["self_completed"] else "")
+    )
+
+    answers = scoring.get_submission_answers(sub_id)
+    if not answers.empty:
+        st.markdown("**Answers**")
+        st.dataframe(
+            answers[["label", "answer_text", "answer_number"]].rename(
+                columns={"label": "Question", "answer_text": "Answer",
+                         "answer_number": "Value"}),
+            hide_index=True, use_container_width=True,
+        )
+
+    if sub["summary"]:
+        st.markdown("**Team summary**")
+        st.info(sub["summary"])
+
+    files = scoring.list_submission_files(sub_id)
+    if files:
+        st.markdown("**Evidence**")
+        for meta in files:
+            fetched = scoring.get_file_content(int(meta["id"]))
+            if fetched is None:
+                continue
+            filename, mime, content = fetched
+            st.download_button(
+                f'⬇️ {filename}  ({meta["byte_size"] / 1024:.0f} KB)',
+                data=content, file_name=filename, mime=mime,
+                key=f"dl_{meta['id']}",
+            )
+
+    st.divider()
+    reviewer = st.session_state.get("trainer_name", "Unknown")
+    with st.form(f"review_form_{sub_id}"):
+        award = st.number_input(
+            "Points to award", min_value=0, max_value=max_points,
+            value=min(int(float(sub["self_points"] or 0)), max_points), step=1,
+        )
+        notes = st.text_area("Review notes (optional)", value=sub["review_notes"] or "")
+        accept = st.form_submit_button("✅ Accept & post to leaderboard", type="primary")
+
+    if accept:
+        scoring.accept_submission(sub_id, float(award), reviewer, notes or None)
+        _cached_leaderboard.clear()
+        st.success(f"Accepted — {award:.0f} pts posted for {sub['team']}.")
+        st.rerun()
+
+    a1, a2 = st.columns(2)
+    if a1.button("🔄 Reopen for resubmission"):
+        scoring.set_submission_status(sub_id, "reopened", reviewer)
+        st.success("Reopened — the team can submit again.")
+        st.rerun()
+    if a2.button("🚫 Void submission"):
+        scoring.set_submission_status(sub_id, "void", reviewer)
+        st.warning("Submission voided.")
+        st.rerun()
 
 
 # --------------------------------------------------------------------------- #
@@ -679,18 +984,27 @@ def tab_setup() -> None:
 is_trainer = trainer_gate()
 
 if is_trainer:
-    tabs = st.tabs(["🏆 Leaderboard", "📝 Score Entry", "📋 Scenarios", "⚙️ Setup"])
+    tabs = st.tabs([
+        "🏆 Leaderboard", "📤 Submit Work", "📥 Submissions",
+        "📝 Score Entry", "📋 Scenarios", "⚙️ Setup",
+    ])
     with tabs[0]:
         tab_leaderboard()
     with tabs[1]:
-        tab_score_entry()
+        tab_submit()
     with tabs[2]:
-        tab_scenarios(can_edit=True)
+        tab_submissions()
     with tabs[3]:
+        tab_score_entry()
+    with tabs[4]:
+        tab_scenarios(can_edit=True)
+    with tabs[5]:
         tab_setup()
 else:
-    tabs = st.tabs(["🏆 Leaderboard", "📋 Scenarios"])
+    tabs = st.tabs(["🏆 Leaderboard", "📤 Submit Work", "📋 Scenarios"])
     with tabs[0]:
         tab_leaderboard()
     with tabs[1]:
+        tab_submit()
+    with tabs[2]:
         tab_scenarios(can_edit=False)
