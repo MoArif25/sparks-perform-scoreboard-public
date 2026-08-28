@@ -1145,6 +1145,108 @@ def set_submission_status(submission_id: int, status: str, reviewer: str) -> Non
             (status, reviewer, submission_id))
 
 
+def get_team_submission_map(team_id: int) -> dict[int, str]:
+    """Scenario number -> submission status for one team."""
+    with _connect() as conn:
+        rows = _fetchall(conn,
+            "SELECT scenario_num, status FROM submissions WHERE team_id=?",
+            (team_id,))
+    return {int(r["scenario_num"]): str(r["status"]) for r in rows}
+
+
+def export_submissions() -> pd.DataFrame:
+    """Flat export of every submission, one row per submission."""
+    with _connect() as conn:
+        return _read_sql(
+            """SELECT s.id AS submission_id, t.name AS team, s.scenario_num,
+                      COALESCE(sc.title, '') AS scenario, s.status, s.attempt_no,
+                      s.self_completed, s.self_points, s.final_points,
+                      s.summary, s.submitted_by,
+                      CAST(s.submitted_at AS TEXT) AS submitted_at,
+                      s.reviewed_by, CAST(s.reviewed_at AS TEXT) AS reviewed_at,
+                      s.review_notes,
+                      (SELECT COUNT(*) FROM submission_files f
+                        WHERE f.submission_id = s.id) AS file_count
+               FROM submissions s
+               JOIN teams t           ON t.id = s.team_id
+               LEFT JOIN scenarios sc ON sc.num = s.scenario_num
+               ORDER BY s.id""",
+            conn)
+
+
+def export_submission_answers() -> pd.DataFrame:
+    """Flat export of every answered sub-scenario question."""
+    with _connect() as conn:
+        return _read_sql(
+            """SELECT a.submission_id, t.name AS team, s.scenario_num,
+                      a.item_id, a.label, a.answer_text, a.answer_number,
+                      a.awarded_points, a.auto_result
+               FROM submission_answers a
+               JOIN submissions s ON s.id = a.submission_id
+               JOIN teams t       ON t.id = s.team_id
+               ORDER BY a.submission_id, a.id""",
+            conn)
+
+
+def iter_all_files() -> list[dict]:
+    """Every uploaded file with its content, for archive export."""
+    with _connect() as conn:
+        rows = _fetchall(conn,
+            """SELECT f.id, f.filename, f.byte_size, f.submission_id,
+                      t.name AS team, s.scenario_num
+               FROM submission_files f
+               JOIN submissions s ON s.id = f.submission_id
+               JOIN teams t       ON t.id = s.team_id
+               ORDER BY f.id""")
+    out = []
+    for row in rows:
+        fetched = get_file_content(int(row["id"]))
+        if fetched is None:
+            continue
+        row["content"] = fetched[2]
+        out.append(row)
+    return out
+
+
+def storage_usage() -> dict:
+    """Row counts and total evidence bytes, for the retention panel."""
+    with _connect() as conn:
+        subs = _fetchone(conn, "SELECT COUNT(*) AS n FROM submissions")
+        answers = _fetchone(conn, "SELECT COUNT(*) AS n FROM submission_answers")
+        files = _fetchone(conn,
+            "SELECT COUNT(*) AS n, COALESCE(SUM(byte_size), 0) AS total "
+            "FROM submission_files")
+    return {
+        "submissions": int(subs["n"]) if subs else 0,
+        "answers": int(answers["n"]) if answers else 0,
+        "files": int(files["n"]) if files else 0,
+        "bytes": int(files["total"]) if files else 0,
+    }
+
+
+def delete_submission(submission_id: int) -> None:
+    """Permanently remove a submission and its answers/files."""
+    with _connect() as conn:
+        _execute(conn, "DELETE FROM submission_answers WHERE submission_id=?",
+                 (submission_id,))
+        _execute(conn, "DELETE FROM submission_files WHERE submission_id=?",
+                 (submission_id,))
+        _execute(conn, "DELETE FROM submissions WHERE id=?", (submission_id,))
+
+
+def delete_all_submissions() -> None:
+    """Clear every submission, answer and uploaded file.
+
+    Needed between events: resetting scores alone leaves submission rows in
+    place, and the one-per-team-per-scenario constraint would then block
+    teams from submitting again.
+    """
+    with _connect() as conn:
+        _execute(conn, "DELETE FROM submission_answers")
+        _execute(conn, "DELETE FROM submission_files")
+        _execute(conn, "DELETE FROM submissions")
+
+
 # ---------------------------------------------------------------------------
 # Scoring computation
 # ---------------------------------------------------------------------------

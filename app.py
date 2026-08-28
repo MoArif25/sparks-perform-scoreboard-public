@@ -18,6 +18,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import zipfile
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -159,58 +161,89 @@ def trainer_gate() -> bool:
 # --------------------------------------------------------------------------- #
 # Leaderboard
 # --------------------------------------------------------------------------- #
-@st.cache_data(ttl=10, show_spinner=False)
+REFRESH_SECONDS = 15
+
+
+@st.cache_data(ttl=REFRESH_SECONDS - 1, show_spinner=False)
 def _cached_leaderboard():
-    """Cache leaderboard reads for 10s so live refreshes don't hit the
-    database on every redraw. Cleared immediately when a score is saved."""
+    """Cache leaderboard reads so live refreshes don't hit the database on
+    every redraw. TTL sits just under the refresh interval so each cycle makes
+    at most one round trip. Cleared immediately when a score is saved."""
     bonus_table = scoring.get_time_bonus_table()
     return scoring.build_leaderboard(bonus_table)
 
 
-def render_leaderboard_body() -> None:
-    """Lightweight live part: metrics + standings table only.
-    Kept minimal so the auto-refresh fragment redraws quickly without flicker.
+def _standings_html(lb: pd.DataFrame) -> str:
+    """Render the whole live block as one HTML string.
+
+    Streamlit's dataframe/metric widgets are React components that remount on
+    every fragment rerun, which is what causes the visible flicker on a
+    projector. A single markdown block redraws without remounting.
     """
+    leader = lb.iloc[0]
+    scoring_teams = int((lb["total_points"] > 0).sum())
+    top = float(max(lb["total_points"].max(), 1))
+
+    cards = [
+        ("🏆 Leader", escape(str(leader["team"])), f'{leader["total_points"]:.0f} pts'),
+        ("Teams scoring", str(scoring_teams), ""),
+        ("Leading team points", f'{leader["total_points"]:.0f}', ""),
+    ]
+    card_html = "".join(
+        '<div style="flex:1;min-width:140px;padding:0.6rem 0.9rem;border:1px solid '
+        'rgba(128,128,128,0.25);border-radius:0.5rem;">'
+        f'<div style="font-size:0.8rem;opacity:0.7;">{label}</div>'
+        f'<div style="font-size:1.5rem;font-weight:700;line-height:1.25;">{value}</div>'
+        f'<div style="font-size:0.85rem;opacity:0.75;">{sub}</div>'
+        "</div>"
+        for label, value, sub in cards
+    )
+
+    rows = []
+    for _, r in lb.iterrows():
+        rank = int(r["rank"])
+        medal = MEDALS.get(rank, "")
+        pct = max(2.0, float(r["total_points"]) / top * 100.0)
+        rows.append(
+            "<tr>"
+            f'<td style="padding:0.35rem 0.5rem;white-space:nowrap;">{medal} {rank}</td>'
+            f'<td style="padding:0.35rem 0.5rem;font-weight:600;">{escape(str(r["team"]))}</td>'
+            f'<td style="padding:0.35rem 0.5rem;text-align:right;">{r["base_points"]:.0f}</td>'
+            f'<td style="padding:0.35rem 0.5rem;text-align:right;">{r["time_bonus"]:.0f}</td>'
+            f'<td style="padding:0.35rem 0.5rem;text-align:right;font-weight:700;">{r["total_points"]:.0f}</td>'
+            '<td style="padding:0.35rem 0.5rem;width:38%;">'
+            '<div style="background:rgba(128,128,128,0.18);border-radius:0.35rem;height:0.65rem;">'
+            f'<div style="width:{pct:.1f}%;background:#21c354;height:100%;border-radius:0.35rem;"></div>'
+            "</div></td>"
+            f'<td style="padding:0.35rem 0.5rem;text-align:right;">{int(r["scenarios_completed"])}</td>'
+            "</tr>"
+        )
+
+    headers = ["Rank", "Team", "Reviewer pts", "Speed bonus", "Total", "", "Done"]
+    header_html = "".join(
+        '<th style="padding:0.4rem 0.5rem;text-align:left;font-size:0.8rem;'
+        f'opacity:0.7;border-bottom:1px solid rgba(128,128,128,0.3);">{h}</th>'
+        for h in headers
+    )
+
+    return (
+        f'<div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1rem;">{card_html}</div>'
+        '<div style="font-size:1.35rem;font-weight:600;margin:0.3rem 0 0.5rem;">Standings</div>'
+        '<table style="width:100%;border-collapse:collapse;">'
+        f"<thead><tr>{header_html}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def render_leaderboard_body() -> None:
+    """Lightweight live part: metrics + standings, drawn as a single HTML
+    block so the auto-refresh doesn't remount widgets and flicker."""
     lb = _cached_leaderboard()
 
     if lb.empty:
         st.info("No teams yet.")
         return
 
-    leader = lb.iloc[0]
-    cols = st.columns(3)
-    cols[0].metric("🏆 Leader", leader["team"], f'{leader["total_points"]:.0f} pts')
-    cols[1].metric("Teams scoring", int((lb["total_points"] > 0).sum()))
-    cols[2].metric("Leading team points", f'{leader["total_points"]:.0f}')
-
-    st.subheader("Standings")
-    display = lb.copy()
-    display["Rank"] = display["rank"].map(lambda r: f'{MEDALS.get(r, "")} {r}'.strip())
-    display = display.rename(
-        columns={
-            "team": "Team",
-            "base_points": "Reviewer pts",
-            "time_bonus": "Speed bonus",
-            "total_points": "Total",
-            "scenarios_completed": "Done",
-            "total_minutes": "Time (min)",
-        }
-    )
-    display = display[
-        ["Rank", "Team", "Reviewer pts", "Speed bonus", "Total", "Done", "Time (min)"]
-    ]
-    st.dataframe(
-        display,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Total": st.column_config.ProgressColumn(
-                "Total", format="%d", min_value=0,
-                max_value=float(max(lb["total_points"].max(), 1)),
-                color="green",
-            ),
-        },
-    )
+    st.markdown(_standings_html(lb), unsafe_allow_html=True)
 
 
 def render_leaderboard_extras() -> None:
@@ -230,9 +263,9 @@ def render_leaderboard_extras() -> None:
         st.markdown(scoring.speed_bonus_explanation())
 
 
-@st.fragment(run_every=15)
+@st.fragment(run_every=REFRESH_SECONDS)
 def live_leaderboard() -> None:
-    st.caption("🔴 Live · refreshes every 15 seconds")
+    st.caption(f"🔴 Live · refreshes every {REFRESH_SECONDS} seconds")
     render_leaderboard_body()
 
 
@@ -374,17 +407,17 @@ def _parse_options(raw: str | None) -> list[str]:
     return [o.strip() for o in str(raw).split(separator) if o.strip()]
 
 
-def _render_item(item: pd.Series) -> dict:
+def _render_item(item: pd.Series, key_prefix: str) -> dict:
     """Render one sub-scenario question and return its answer row."""
     label = str(item["label"])
     item_type = str(item["item_type"] or "text")
-    key = f"item_{int(item['id'])}"
+    key = f"{key_prefix}_item_{int(item['id'])}"
     required = bool(item["required"])
     display = f"{label} *" if required else label
     if pd.notna(item["max_points"]):
         display += f"  ·  {float(item['max_points']):g} pts"
 
-    answer = {"item_id": int(item["id"]), "label": label,
+    answer = {"item_id": int(item["id"]), "label": label, "required": required,
               "answer_text": None, "answer_number": None}
 
     if item_type == "long_text":
@@ -409,6 +442,87 @@ def _render_item(item: pd.Series) -> dict:
     return answer
 
 
+_LOCKED_STATUSES = {"submitted": "✅ Submitted — pending review",
+                    "accepted": "🏅 Reviewed and scored",
+                    "void": "🚫 Voided by a trainer"}
+
+
+def _render_scenario_block(scen_num: int, title: str, max_points: int,
+                           scoring_text) -> dict:
+    """Render the inputs for one scenario and collect its submission payload."""
+    prefix = f"s{scen_num}"
+    caption = f"Max points: **{max_points}**"
+    if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
+        caption += f" · Scoring: *{scoring_text}*"
+    st.caption(caption)
+
+    items = scoring.get_scenario_items(scen_num)
+    answers: list[dict] = []
+
+    if items.empty:
+        summary = st.text_area(
+            "What did your team do?", height=140, key=f"{prefix}_summary",
+            placeholder="Describe your approach, what you configured, and the result",
+        )
+    else:
+        for _, item in items.iterrows():
+            answers.append(_render_item(item, prefix))
+        summary = st.text_area(
+            "Anything else the reviewer should know? (optional)",
+            key=f"{prefix}_summary",
+        )
+
+    uploads = st.file_uploader(
+        f"Evidence (optional) — max {scoring.MAX_FILES_PER_SUBMISSION} files, "
+        f"{scoring.MAX_FILE_BYTES // (1024 * 1024)} MB each",
+        accept_multiple_files=True, key=f"{prefix}_files",
+    )
+
+    c1, c2 = st.columns(2)
+    self_completed = c1.checkbox("Completed in full", key=f"{prefix}_done")
+    self_points = c2.number_input(
+        "Points you believe you earned", min_value=0, max_value=max_points,
+        value=0, step=1, key=f"{prefix}_points",
+        help="A trainer confirms or adjusts this during review.",
+    )
+
+    return {
+        "scenario_num": scen_num, "title": title, "answers": answers,
+        "summary": summary, "uploads": uploads or [],
+        "self_completed": self_completed, "self_points": float(self_points),
+        "has_items": not items.empty,
+    }
+
+
+def _validate_block(block: dict) -> str | None:
+    """Return an error message for one scenario block, or None if valid."""
+    label = f'#{block["scenario_num"]} {block["title"]}'
+
+    if len(block["uploads"]) > scoring.MAX_FILES_PER_SUBMISSION:
+        return f'{label}: attach at most {scoring.MAX_FILES_PER_SUBMISSION} files.'
+
+    for upload in block["uploads"]:
+        if len(upload.getvalue()) > scoring.MAX_FILE_BYTES:
+            return (
+                f'{label}: "{upload.name}" is '
+                f'{len(upload.getvalue()) / (1024 * 1024):.1f} MB — the limit is '
+                f'{scoring.MAX_FILE_BYTES // (1024 * 1024)} MB per file.'
+            )
+
+    missing = [
+        a["label"] for a in block["answers"]
+        if a["required"] and not str(a["answer_text"] or "").strip()
+        and a["answer_number"] is None
+    ]
+    if missing:
+        return f'{label}: answer the required questions — {", ".join(missing)}.'
+
+    if not block["has_items"] and not str(block["summary"] or "").strip():
+        return f'{label}: describe what your team did before submitting.'
+
+    return None
+
+
 def tab_submit() -> None:
     st.header("📤 Submit Your Work")
     teams = scoring.get_teams()
@@ -422,135 +536,178 @@ def tab_submit() -> None:
         return
 
     scen_lookup = scen.set_index("num")
-    c1, c2 = st.columns(2)
-    team_id = int(c1.selectbox(
+    team_id = int(st.selectbox(
         "Your team",
         options=teams["id"].tolist(),
         format_func=lambda i: teams.set_index("id").loc[i, "name"],
         key="submit_team",
     ))
-    scen_num = int(c2.selectbox(
-        "Scenario",
-        options=scen["num"].tolist(),
+
+    status_map = scoring.get_team_submission_map(team_id)
+    locked = {n: s for n, s in status_map.items() if s in _LOCKED_STATUSES}
+    available = [int(n) for n in scen["num"].tolist() if int(n) not in locked]
+
+    if locked:
+        with st.expander(f"📋 Your team's submitted scenarios ({len(locked)})"):
+            rows = [
+                {"Scenario": f'#{n} — {scen_lookup.loc[n, "title"]}'
+                            if n in scen_lookup.index else f"#{n}",
+                 "Status": _LOCKED_STATUSES[s]}
+                for n, s in sorted(locked.items())
+            ]
+            st.dataframe(pd.DataFrame(rows), hide_index=True,
+                         use_container_width=True)
+
+    if not available:
+        st.success("🎉 Your team has submitted every scenario.")
+        return
+
+    picked = st.multiselect(
+        "Scenarios to submit",
+        options=available,
         format_func=lambda n: f'#{n} — {scen_lookup.loc[n, "title"]}',
-        key="submit_scenario",
-    ))
+        key="submit_scenarios",
+        help="Pick one or several. Each scenario is submitted once.",
+    )
 
-    max_points = int(scen_lookup.loc[scen_num, "max_points"])
-    scoring_text = scen_lookup.loc[scen_num, "scoring"]
-    caption = f"Max points: **{max_points}**"
-    if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
-        caption += f" · Scoring: *{scoring_text}*"
-    st.caption(caption)
-
-    existing = scoring.get_submission_for(team_id, scen_num)
-    if existing and existing["status"] == "submitted":
-        st.success("✅ Submitted — pending trainer review.")
-        st.caption("Each team submits once per scenario. Ask a trainer if you need to change it.")
+    if not picked:
+        st.info("Select one or more scenarios above to start.")
         return
-    if existing and existing["status"] == "accepted":
-        st.success("🏅 Reviewed and scored.")
-        st.metric("Points awarded", f'{float(existing["final_points"] or 0):.0f}')
-        return
-    if existing and existing["status"] == "void":
-        st.error("This submission was voided by a trainer. Please speak to your trainer.")
-        return
-    if existing and existing["status"] == "reopened":
-        st.info("🔄 A trainer reopened this scenario — you can submit again below.")
 
-    items = scoring.get_scenario_items(scen_num)
+    reopened = [n for n in picked if status_map.get(n) == "reopened"]
+    if reopened:
+        st.info(f"🔄 Reopened by a trainer — you can submit again: {reopened}")
 
-    with st.form(f"submit_form_{team_id}_{scen_num}", clear_on_submit=False):
-        answers: list[dict] = []
-
-        if items.empty:
-            st.markdown("**What did your team do?**")
-            summary = st.text_area(
-                "Describe your approach, what you configured, and the result",
-                height=180,
-            )
-        else:
-            st.markdown("**Scenario questions**")
-            for _, item in items.iterrows():
-                answers.append(_render_item(item))
-            st.divider()
-            summary = st.text_area("Anything else the reviewer should know? (optional)")
+    with st.form("submit_form", clear_on_submit=False):
+        blocks = []
+        for n in picked:
+            title = str(scen_lookup.loc[n, "title"])
+            with st.expander(f'#{n} — {title}', expanded=len(picked) == 1):
+                blocks.append(_render_scenario_block(
+                    n, title, int(scen_lookup.loc[n, "max_points"]),
+                    scen_lookup.loc[n, "scoring"],
+                ))
 
         st.divider()
-        st.markdown("**Evidence (optional)**")
-        uploads = st.file_uploader(
-            f"Screenshots, config exports, output files — max {scoring.MAX_FILES_PER_SUBMISSION} "
-            f"files, {scoring.MAX_FILE_BYTES // (1024 * 1024)} MB each",
-            accept_multiple_files=True,
+        submitted_by = st.text_input("Submitted by (optional)",
+                                     placeholder="Your name")
+        send = st.form_submit_button(
+            f"📤 Submit {len(picked)} scenario{'s' if len(picked) > 1 else ''}",
+            type="primary",
         )
-
-        st.divider()
-        sc1, sc2 = st.columns(2)
-        self_completed = sc1.checkbox("We completed this scenario in full")
-        self_points = sc2.number_input(
-            "Points you believe you earned", min_value=0, max_value=max_points,
-            value=0, step=1,
-            help="A trainer confirms or adjusts this during review.",
-        )
-        submitted_by = st.text_input("Submitted by (optional)", placeholder="Your name")
-
-        send = st.form_submit_button("📤 Submit", type="primary")
 
     if not send:
         return
 
-    uploads = uploads or []
-    if len(uploads) > scoring.MAX_FILES_PER_SUBMISSION:
-        st.error(f"Please attach at most {scoring.MAX_FILES_PER_SUBMISSION} files.")
+    # Validate everything before writing, so a partial batch never lands.
+    errors = [msg for msg in (_validate_block(b) for b in blocks) if msg]
+    if errors:
+        for msg in errors:
+            st.error(msg)
         return
 
-    files = []
-    for upload in uploads:
-        data = upload.getvalue()
-        if len(data) > scoring.MAX_FILE_BYTES:
-            st.error(
-                f"'{upload.name}' is {len(data) / (1024 * 1024):.1f} MB — the limit is "
-                f"{scoring.MAX_FILE_BYTES // (1024 * 1024)} MB per file."
+    saved, failed = [], []
+    for block in blocks:
+        files = [
+            {"filename": u.name, "mime_type": u.type, "content": u.getvalue()}
+            for u in block["uploads"]
+        ]
+        try:
+            scoring.save_submission(
+                team_id=team_id,
+                scenario_num=block["scenario_num"],
+                summary=block["summary"],
+                self_completed=block["self_completed"],
+                self_points=block["self_points"],
+                submitted_by=submitted_by.strip() or None,
+                answers=block["answers"],
+                files=files,
             )
-            return
-        files.append({"filename": upload.name, "mime_type": upload.type, "content": data})
+            saved.append(f'#{block["scenario_num"]}')
+        except Exception as exc:
+            failed.append(f'#{block["scenario_num"]}: {exc}')
 
-    missing = [
-        a["label"] for a, (_, item) in zip(answers, items.iterrows())
-        if bool(item["required"]) and not str(a["answer_text"] or "").strip()
-        and a["answer_number"] is None
-    ]
-    if missing:
-        st.error("Please answer the required questions: " + ", ".join(missing))
-        return
-
-    if items.empty and not str(summary or "").strip():
-        st.error("Please describe what your team did before submitting.")
-        return
-
-    try:
-        scoring.save_submission(
-            team_id=team_id,
-            scenario_num=scen_num,
-            summary=summary,
-            self_completed=self_completed,
-            self_points=float(self_points),
-            submitted_by=submitted_by.strip() or None,
-            answers=answers,
-            files=files,
-        )
-    except ValueError as exc:
-        st.error(str(exc))
-        return
-
-    st.success("✅ Submitted — pending trainer review.")
-    st.balloons()
-    st.rerun()
+    if saved:
+        st.success(f"✅ Submitted {len(saved)} scenario(s): {', '.join(saved)} — pending trainer review.")
+        st.balloons()
+    for msg in failed:
+        st.error(msg)
+    if saved and not failed:
+        st.rerun()
 
 
 # --------------------------------------------------------------------------- #
 # Submissions inbox (trainers only)
 # --------------------------------------------------------------------------- #
+def _evidence_zip() -> bytes:
+    """Bundle every uploaded file into one archive, foldered by submission."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for f in scoring.iter_all_files():
+            safe_team = str(f["team"]).replace("/", "-").replace("\\", "-")
+            folder = f'sub{f["submission_id"]}_{safe_team}_scenario{f["scenario_num"]}'
+            archive.writestr(f'{folder}/{f["filename"]}', f["content"])
+    return buffer.getvalue()
+
+
+def _render_submission_archive() -> None:
+    usage = scoring.storage_usage()
+    with st.expander("💾 Where this data lives, and exporting it"):
+        st.markdown(
+            "Everything teams submit is written to **Supabase Postgres** — the same "
+            "database as the scores. Nothing is kept on the Streamlit server, whose "
+            "disk is wiped on every restart.\n\n"
+            "| Data | Table |\n|---|---|\n"
+            "| Submission header, summary, self-reported points | `submissions` |\n"
+            "| Answers to sub-scenario questions | `submission_answers` |\n"
+            "| Uploaded evidence files (binary) | `submission_files` |\n\n"
+            "**Retention: indefinite.** There is no expiry job — rows stay until "
+            "someone deletes them here or in Supabase. Note that *Reset all scores* "
+            "in Setup clears scores only and deliberately leaves submissions intact."
+        )
+        u1, u2, u3 = st.columns(3)
+        u1.metric("Submissions", usage["submissions"])
+        u2.metric("Files", usage["files"])
+        u3.metric("Evidence size", f'{usage["bytes"] / (1024 * 1024):.1f} MB')
+
+        if usage["bytes"] > 300 * 1024 * 1024:
+            st.warning(
+                "Evidence is approaching the Supabase free-tier database limit. "
+                "Export and purge, or move files to Supabase Storage."
+            )
+
+        e1, e2, e3 = st.columns(3)
+        e1.download_button(
+            "⬇️ Submissions (CSV)",
+            data=scoring.export_submissions().to_csv(index=False).encode("utf-8"),
+            file_name="spark_submissions.csv", mime="text/csv",
+            disabled=usage["submissions"] == 0,
+        )
+        e2.download_button(
+            "⬇️ Answers (CSV)",
+            data=scoring.export_submission_answers().to_csv(index=False).encode("utf-8"),
+            file_name="spark_submission_answers.csv", mime="text/csv",
+            disabled=usage["answers"] == 0,
+        )
+        with e3:
+            if usage["files"] == 0:
+                st.button("⬇️ Evidence (ZIP)", disabled=True)
+            elif st.session_state.get("evidence_zip_ready"):
+                st.download_button(
+                    "⬇️ Evidence (ZIP)", data=st.session_state["evidence_zip"],
+                    file_name="spark_evidence.zip", mime="application/zip",
+                )
+            elif st.button("📦 Build evidence ZIP"):
+                st.session_state["evidence_zip"] = _evidence_zip()
+                st.session_state["evidence_zip_ready"] = True
+                st.rerun()
+
+        st.caption(
+            "Take these exports at the end of each event — they are your backup "
+            "and the only copy if the database is later purged."
+        )
+
+
 def tab_submissions() -> None:
     st.header("📥 Submissions Inbox")
     subs = scoring.get_submissions_overview()
@@ -564,6 +721,8 @@ def tab_submissions() -> None:
     m1.metric("Awaiting review", pending)
     m2.metric("Accepted", int((subs["status"] == "accepted").sum()))
     m3.metric("Total submissions", len(subs))
+
+    _render_submission_archive()
 
     status_filter = st.multiselect(
         "Show", scoring.SUBMISSION_STATUSES, default=["submitted", "reopened"],
@@ -978,6 +1137,27 @@ def tab_setup() -> None:
         if st.button("Reset all scores", type="primary", disabled=confirm != "RESET"):
             scoring.reset_all_scores()
             st.success("All scores cleared.")
+            st.rerun()
+
+    with st.expander("⚠️ Danger zone — delete all submissions"):
+        usage = scoring.storage_usage()
+        st.write(
+            f'This permanently deletes **{usage["submissions"]} submissions**, '
+            f'their answers and **{usage["files"]} uploaded files** '
+            f'({usage["bytes"] / (1024 * 1024):.1f} MB). Scores are kept.'
+        )
+        st.info(
+            "Run this between events. Submissions are one-per-team-per-scenario, "
+            "so leftover rows would block teams from submitting next time. "
+            "**Export from the Submissions tab first — this cannot be undone.**"
+        )
+        confirm_subs = st.text_input("Type DELETE to confirm", key="purge_subs")
+        if st.button("Delete all submissions", type="primary",
+                     disabled=confirm_subs != "DELETE"):
+            scoring.delete_all_submissions()
+            st.session_state.pop("evidence_zip", None)
+            st.session_state.pop("evidence_zip_ready", None)
+            st.success("All submissions deleted.")
             st.rerun()
 
 
