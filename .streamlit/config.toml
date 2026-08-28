@@ -1,0 +1,4 @@
+[server]
+# Matches MAX_FILE_BYTES in scoring.py so oversized evidence is rejected by the
+# browser instead of after a long upload.
+maxUploadSize = 5

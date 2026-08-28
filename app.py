@@ -438,7 +438,10 @@ def tab_submit() -> None:
 
     max_points = int(scen_lookup.loc[scen_num, "max_points"])
     scoring_text = scen_lookup.loc[scen_num, "scoring"]
-    st.caption(f"Max points: **{max_points}** · Scoring: *{scoring_text}*")
+    caption = f"Max points: **{max_points}**"
+    if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
+        caption += f" · Scoring: *{scoring_text}*"
+    st.caption(caption)
 
     existing = scoring.get_submission_for(team_id, scen_num)
     if existing and existing["status"] == "submitted":
