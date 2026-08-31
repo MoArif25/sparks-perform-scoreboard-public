@@ -627,6 +627,7 @@ def init_db() -> None:
             )
 
         _migrate_allow_repeat_attempts(conn)
+        _migrate_add_part_label(conn)
 
 
 def _migrate_allow_repeat_attempts(conn) -> None:
@@ -677,6 +678,16 @@ def _migrate_allow_repeat_attempts(conn) -> None:
         DROP TABLE submissions_legacy;
         """
     )
+
+
+def _migrate_add_part_label(conn) -> None:
+    """Add submissions.part_label, naming which part of a scenario an attempt covers."""
+    if _is_pg():
+        _execute(conn, "ALTER TABLE submissions ADD COLUMN IF NOT EXISTS part_label TEXT")
+        return
+    cols = {c["name"] for c in _fetchall(conn, "PRAGMA table_info(submissions)")}
+    if "part_label" not in cols:
+        _execute(conn, "ALTER TABLE submissions ADD COLUMN part_label TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -979,11 +990,14 @@ def save_submission(
     submitted_by: str | None,
     answers: list[dict],
     files: list[dict],
+    part_label: str | None = None,
 ) -> int:
     """Record a new attempt at a scenario.
 
-    Teams may submit the same scenario repeatedly; every attempt is kept as its
-    own row so trainers can see the full history.
+    Teams may submit the same scenario repeatedly, once per sub-scenario, and a
+    trainer can accept several of those attempts. ``part_label`` is the team's
+    own description of which part this attempt covers, used until real
+    sub-scenario questions exist.
 
     ``answers`` items carry ``item_id``, ``label``, ``answer_text`` and
     ``answer_number``. ``files`` items carry ``filename``, ``mime_type`` and
@@ -999,10 +1013,10 @@ def save_submission(
 
         sub_id = _insert_returning_id(conn,
             "INSERT INTO submissions "
-            "(team_id, scenario_num, attempt_no, status, summary, "
+            "(team_id, scenario_num, attempt_no, status, summary, part_label, "
             " self_completed, self_points, submitted_by, submitted_at) "
-            f"VALUES (?, ?, ?, 'submitted', ?, ?, ?, ?, {now})",
-            (team_id, scenario_num, attempt_no, summary,
+            f"VALUES (?, ?, ?, 'submitted', ?, ?, ?, ?, ?, {now})",
+            (team_id, scenario_num, attempt_no, summary, part_label,
              1 if self_completed else 0, self_points, submitted_by))
 
         for a in answers:
@@ -1031,8 +1045,8 @@ def get_submissions_overview() -> pd.DataFrame:
             """SELECT s.id, t.name AS team, s.team_id, s.scenario_num,
                       COALESCE(sc.title,
                                'Scenario #' || CAST(s.scenario_num AS TEXT)) AS scenario,
-                      s.status, s.attempt_no, s.self_completed, s.self_points,
-                      s.final_points, s.reviewed_by,
+                      s.status, s.attempt_no, s.part_label, s.self_completed,
+                      s.self_points, s.final_points, s.reviewed_by,
                       COALESCE(sc.max_points, 0) AS max_points,
                       CAST(s.submitted_at AS TEXT) AS submitted_at,
                       (SELECT COUNT(*) FROM submission_files f
@@ -1090,53 +1104,106 @@ def get_file_content(file_id: int) -> tuple[str, str, bytes] | None:
     return row["filename"], row["mime_type"] or "application/octet-stream", bytes(content)
 
 
+def _recompute_scenario_score(conn, team_id: int, scenario_num: int,
+                              team_name: str, reviewer: str,
+                              notes: str | None) -> float:
+    """Set a scenario's score to the sum of that team's accepted attempts.
+
+    A team may submit one scenario several times (one per sub-scenario), and a
+    trainer can accept more than one of them, so the scenario's score is the
+    total of everything accepted. Deriving it this way instead of adding as we
+    go keeps it correct when an award is revised or an attempt is voided.
+    """
+    row = _fetchone(conn,
+        "SELECT COALESCE(SUM(final_points), 0) AS total FROM submissions "
+        "WHERE team_id=? AND scenario_num=? AND status='accepted'",
+        (team_id, scenario_num))
+    total = float(row["total"] or 0) if row else 0.0
+
+    prior = _fetchone(conn,
+        "SELECT minutes FROM scores WHERE team_id=? AND scenario_num=?",
+        (team_id, scenario_num))
+    minutes = prior["minutes"] if prior else None
+    passed = 1 if total > 0 else 0
+    now = _now_sql()
+
+    if _is_pg():
+        _execute(conn,
+            """INSERT INTO scores
+                   (team_id, scenario_num, status, points, minutes,
+                    passed, notes, updated_at)
+               VALUES (%s, %s, 'Reviewed', %s, %s, %s, %s, NOW())
+               ON CONFLICT (team_id, scenario_num) DO UPDATE SET
+                   status='Reviewed',
+                   points=EXCLUDED.points,
+                   minutes=EXCLUDED.minutes,
+                   passed=EXCLUDED.passed,
+                   notes=EXCLUDED.notes,
+                   updated_at=NOW()""",
+            (team_id, scenario_num, total, minutes, passed, notes))
+    else:
+        _execute(conn,
+            """INSERT INTO scores
+                   (team_id, scenario_num, status, points, minutes,
+                    passed, notes, updated_at)
+               VALUES (?, ?, 'Reviewed', ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(team_id, scenario_num) DO UPDATE SET
+                   status='Reviewed',
+                   points=excluded.points,
+                   minutes=excluded.minutes,
+                   passed=excluded.passed,
+                   notes=excluded.notes,
+                   updated_at=datetime('now')""",
+            (team_id, scenario_num, total, minutes, passed, notes))
+
+    _execute(conn,
+        "INSERT INTO score_log "
+        "(team_id, team_name, scenario_num, status, points, minutes, "
+        " passed, notes, trainer_name, logged_at) "
+        f"VALUES (?, ?, ?, 'Reviewed', ?, ?, ?, ?, ?, {now})",
+        (team_id, team_name, scenario_num, total, minutes, passed,
+         notes, reviewer))
+    return total
+
+
+def get_accepted_totals() -> dict[tuple[int, int], float]:
+    """(team_id, scenario_num) -> points already accepted across attempts."""
+    with _connect() as conn:
+        rows = _fetchall(conn,
+            "SELECT team_id, scenario_num, COALESCE(SUM(final_points), 0) AS total "
+            "FROM submissions WHERE status='accepted' "
+            "GROUP BY team_id, scenario_num")
+    return {
+        (int(r["team_id"]), int(r["scenario_num"])): float(r["total"] or 0)
+        for r in rows
+    }
+
+
 def accept_submission(
     submission_id: int,
     final_points: float,
     reviewer: str,
     notes: str | None = None,
-) -> None:
-    """Approve a submission and push the awarded points into the leaderboard."""
-    sub = get_submission(submission_id)
-    if sub is None:
-        raise ValueError(f"Submission {submission_id} not found.")
-
-    team_id = int(sub["team_id"])
-    scenario_num = int(sub["scenario_num"])
-
-    # Submissions never record a time. Carry any existing minutes across:
-    # nulling them would drop this team out of the scenario's speed-bonus
-    # ranking and silently redistribute bonus points to every other team.
-    prior = get_score(team_id, scenario_num) or {}
-    minutes = prior.get("minutes")
-
-    upsert_score(
-        team_id=team_id,
-        scenario_num=scenario_num,
-        status="Reviewed",
-        points=float(final_points),
-        minutes=minutes,
-        passed=float(final_points) > 0,
-        notes=notes,
-    )
-    log_score_entry(
-        team_id=team_id,
-        team_name=str(sub["team"]),
-        scenario_num=scenario_num,
-        status="Reviewed",
-        points=float(final_points),
-        minutes=minutes,
-        passed=float(final_points) > 0,
-        notes=notes,
-        trainer_name=reviewer,
-    )
-
+) -> float:
+    """Approve one attempt and refresh its scenario's score. Returns the total."""
     now = _now_sql()
     with _connect() as conn:
+        sub = _fetchone(conn,
+            """SELECT s.team_id, s.scenario_num, t.name AS team
+               FROM submissions s JOIN teams t ON t.id = s.team_id
+               WHERE s.id=?""",
+            (submission_id,))
+        if sub is None:
+            raise ValueError(f"Submission {submission_id} not found.")
+
         _execute(conn,
             "UPDATE submissions SET status='accepted', final_points=?, "
             f"reviewed_by=?, reviewed_at={now}, review_notes=? WHERE id=?",
             (float(final_points), reviewer, notes, submission_id))
+
+        return _recompute_scenario_score(
+            conn, int(sub["team_id"]), int(sub["scenario_num"]),
+            str(sub["team"]), reviewer, notes)
 
 
 def count_pending_submissions() -> int:
@@ -1179,6 +1246,7 @@ def accept_submissions_bulk(
     errors: list[str] = []
 
     with _connect() as conn:
+        touched: dict[tuple[int, int], str] = {}
         for sub_id, points in awards.items():
             row = _fetchone(conn,
                 """SELECT s.team_id, s.scenario_num, t.name AS team
@@ -1190,58 +1258,18 @@ def accept_submissions_bulk(
                 errors.append(f"Submission {sub_id} not found.")
                 continue
 
-            team_id = int(row["team_id"])
-            scen = int(row["scenario_num"])
-            points = float(points)
-            passed = 1 if points > 0 else 0
-
-            prior = _fetchone(conn,
-                "SELECT minutes FROM scores WHERE team_id=? AND scenario_num=?",
-                (team_id, scen))
-            minutes = prior["minutes"] if prior else None
-
-            if _is_pg():
-                _execute(conn,
-                    """INSERT INTO scores
-                           (team_id, scenario_num, status, points, minutes,
-                            passed, notes, updated_at)
-                       VALUES (%s, %s, 'Reviewed', %s, %s, %s, %s, NOW())
-                       ON CONFLICT (team_id, scenario_num) DO UPDATE SET
-                           status='Reviewed',
-                           points=EXCLUDED.points,
-                           minutes=EXCLUDED.minutes,
-                           passed=EXCLUDED.passed,
-                           notes=EXCLUDED.notes,
-                           updated_at=NOW()""",
-                    (team_id, scen, points, minutes, passed, notes))
-            else:
-                _execute(conn,
-                    """INSERT INTO scores
-                           (team_id, scenario_num, status, points, minutes,
-                            passed, notes, updated_at)
-                       VALUES (?, ?, 'Reviewed', ?, ?, ?, ?, datetime('now'))
-                       ON CONFLICT(team_id, scenario_num) DO UPDATE SET
-                           status='Reviewed',
-                           points=excluded.points,
-                           minutes=excluded.minutes,
-                           passed=excluded.passed,
-                           notes=excluded.notes,
-                           updated_at=datetime('now')""",
-                    (team_id, scen, points, minutes, passed, notes))
-
-            _execute(conn,
-                "INSERT INTO score_log "
-                "(team_id, team_name, scenario_num, status, points, minutes, "
-                " passed, notes, trainer_name, logged_at) "
-                f"VALUES (?, ?, ?, 'Reviewed', ?, ?, ?, ?, ?, {now})",
-                (team_id, str(row["team"]), scen, points, minutes,
-                 passed, notes, reviewer))
-
             _execute(conn,
                 "UPDATE submissions SET status='accepted', final_points=?, "
                 f"reviewed_by=?, reviewed_at={now}, review_notes=? WHERE id=?",
-                (points, reviewer, notes, sub_id))
+                (float(points), reviewer, notes, sub_id))
+            touched[(int(row["team_id"]), int(row["scenario_num"]))] = str(row["team"])
             accepted += 1
+
+        # Recompute once per scenario, after every award in the batch has been
+        # written, so multiple accepted attempts at one scenario sum correctly.
+        for (team_id, scen), team_name in touched.items():
+            _recompute_scenario_score(conn, team_id, scen, team_name,
+                                      reviewer, notes)
 
     return accepted, errors
 
@@ -1252,10 +1280,21 @@ def set_submission_status(submission_id: int, status: str, reviewer: str) -> Non
         raise ValueError(f"Unsupported status: {status}")
     now = _now_sql()
     with _connect() as conn:
+        sub = _fetchone(conn,
+            """SELECT s.team_id, s.scenario_num, s.status, t.name AS team
+               FROM submissions s JOIN teams t ON t.id = s.team_id
+               WHERE s.id=?""",
+            (submission_id,))
         _execute(conn,
-            "UPDATE submissions SET status=?, reviewed_by=?, "
+            "UPDATE submissions SET status=?, final_points=NULL, reviewed_by=?, "
             f"reviewed_at={now} WHERE id=?",
             (status, reviewer, submission_id))
+
+        # Withdrawing an already-accepted attempt has to take its points back.
+        if sub and sub["status"] == "accepted":
+            _recompute_scenario_score(
+                conn, int(sub["team_id"]), int(sub["scenario_num"]),
+                str(sub["team"]), reviewer, f"Attempt {status}")
 
 
 def get_team_attempts(team_id: int) -> pd.DataFrame:
@@ -1265,7 +1304,7 @@ def get_team_attempts(team_id: int) -> pd.DataFrame:
             "SELECT s.scenario_num, "
             "       COALESCE(sc.title, 'Scenario #' || CAST(s.scenario_num AS TEXT)) "
             "           AS scenario, "
-            "       s.attempt_no, s.status, s.final_points, "
+            "       s.attempt_no, s.part_label, s.status, s.final_points, "
             "       CAST(s.submitted_at AS TEXT) AS submitted_at "
             "FROM submissions s "
             "LEFT JOIN scenarios sc ON sc.num = s.scenario_num "
@@ -1290,8 +1329,8 @@ def export_submissions() -> pd.DataFrame:
         return _read_sql(
             """SELECT s.id AS submission_id, t.name AS team, s.scenario_num,
                       COALESCE(sc.title, '') AS scenario, s.status, s.attempt_no,
-                      s.self_completed, s.self_points, s.final_points,
-                      s.summary, s.submitted_by,
+                      s.part_label, s.self_completed, s.self_points,
+                      s.final_points, s.summary, s.submitted_by,
                       CAST(s.submitted_at AS TEXT) AS submitted_at,
                       s.reviewed_by, CAST(s.reviewed_at AS TEXT) AS reviewed_at,
                       s.review_notes,

@@ -438,14 +438,20 @@ def _render_item(item: pd.Series, key_prefix: str) -> dict:
     return answer
 
 
-def _render_scenario_block(scen_num: int, title: str, max_points: int,
-                           scoring_text) -> dict:
-    """Render the inputs for one scenario and collect its submission payload."""
-    prefix = f"s{scen_num}"
+def _render_scenario_block(slot: int, scen_num: int, title: str,
+                           max_points: int, scoring_text) -> dict:
+    """Render the inputs for one submission slot and collect its payload."""
+    prefix = f"blk{slot}"
     caption = f"Max points: **{max_points}**"
     if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
         caption += f" · Scoring: *{scoring_text}*"
     st.caption(caption)
+
+    part_label = st.text_input(
+        "Which part / sub-scenario is this? (optional)",
+        key=f"{prefix}_part",
+        placeholder="e.g. PLC code, Simulation, Fault 3 — leave blank for the whole scenario",
+    )
 
     items = scoring.get_scenario_items(scen_num)
     answers: list[dict] = []
@@ -479,7 +485,7 @@ def _render_scenario_block(scen_num: int, title: str, max_points: int,
 
     return {
         "scenario_num": scen_num, "title": title, "answers": answers,
-        "summary": summary, "uploads": uploads or [],
+        "summary": summary, "uploads": uploads or [], "part_label": part_label,
         "self_completed": self_completed, "self_points": float(self_points),
         "has_items": not items.empty,
     }
@@ -535,63 +541,59 @@ def tab_submit() -> None:
     ))
 
     attempts = scoring.get_team_attempts(team_id)
-    counts = scoring.get_attempt_counts(team_id)
-
     if not attempts.empty:
         with st.expander(f"📋 Your team's previous attempts ({len(attempts)})"):
             st.dataframe(
                 attempts.rename(columns={
                     "scenario_num": "#", "scenario": "Scenario",
-                    "attempt_no": "Attempt", "status": "Status",
-                    "final_points": "Awarded", "submitted_at": "Submitted"}),
+                    "attempt_no": "Attempt", "part_label": "Part",
+                    "status": "Status", "final_points": "Awarded",
+                    "submitted_at": "Submitted"}),
                 hide_index=True, use_container_width=True,
             )
 
-    def _label(n: int) -> str:
-        title = scen_lookup.loc[n, "title"]
-        tries = counts.get(int(n), 0)
-        suffix = f"  ·  {tries} attempt{'s' if tries > 1 else ''} so far" if tries else ""
-        return f'#{n} — {title}{suffix}'
-
-    picked = st.multiselect(
-        "Scenarios to submit",
-        options=[int(n) for n in scen["num"].tolist()],
-        format_func=_label,
-        key="submit_scenarios",
-        help="Pick one or several. You can submit a scenario as many times as you like.",
+    st.caption(
+        "Add one entry per piece of work. You can pick the **same scenario more "
+        "than once** — one entry per sub-scenario — and name each part below. "
+        "A trainer can accept several of them and the points add up."
     )
 
-    if not picked:
-        st.info("Select one or more scenarios above to start.")
-        return
+    # Slot count lives outside any form so entries can be added on the fly.
+    if "submit_slots" not in st.session_state:
+        st.session_state["submit_slots"] = 1
+    slots = st.session_state["submit_slots"]
 
-    repeats = [n for n in picked if counts.get(n)]
-    if repeats:
-        st.info(
-            "🔁 You have already submitted "
-            + ", ".join(f"#{n}" for n in repeats)
-            + ". Submitting again adds a new attempt; a trainer decides which one counts."
+    c1, c2, _ = st.columns([1, 1, 3])
+    if c1.button("➕ Add another entry"):
+        st.session_state["submit_slots"] = slots + 1
+        st.rerun()
+    if c2.button("➖ Remove last", disabled=slots <= 1):
+        for suffix in ("part", "summary", "files", "done", "points"):
+            st.session_state.pop(f"blk{slots - 1}_{suffix}", None)
+        st.session_state["submit_slots"] = slots - 1
+        st.rerun()
+
+    scen_nums = [int(n) for n in scen["num"].tolist()]
+    blocks = []
+    for i in range(slots):
+        chosen = st.selectbox(
+            f"Entry {i + 1} — scenario",
+            options=scen_nums,
+            format_func=lambda n: f'#{n} — {scen_lookup.loc[n, "title"]}',
+            key=f"blk{i}_scen",
         )
+        with st.container(border=True):
+            blocks.append(_render_scenario_block(
+                i, int(chosen), str(scen_lookup.loc[chosen, "title"]),
+                int(scen_lookup.loc[chosen, "max_points"]),
+                scen_lookup.loc[chosen, "scoring"],
+            ))
 
-    with st.form("submit_form", clear_on_submit=False):
-        blocks = []
-        for n in picked:
-            title = str(scen_lookup.loc[n, "title"])
-            with st.expander(f'#{n} — {title}', expanded=len(picked) == 1):
-                blocks.append(_render_scenario_block(
-                    n, title, int(scen_lookup.loc[n, "max_points"]),
-                    scen_lookup.loc[n, "scoring"],
-                ))
-
-        st.divider()
-        submitted_by = st.text_input("Submitted by (optional)",
-                                     placeholder="Your name")
-        send = st.form_submit_button(
-            f"📤 Submit {len(picked)} scenario{'s' if len(picked) > 1 else ''}",
-            type="primary",
-        )
-
-    if not send:
+    st.divider()
+    submitted_by = st.text_input("Submitted by (optional)", key="submit_by",
+                                 placeholder="Your name")
+    if not st.button(f"📤 Submit {slots} entr{'ies' if slots > 1 else 'y'}",
+                     type="primary"):
         return
 
     # Validate everything before writing, so a partial batch never lands.
@@ -617,19 +619,21 @@ def tab_submit() -> None:
                 submitted_by=submitted_by.strip() or None,
                 answers=block["answers"],
                 files=files,
+                part_label=(block["part_label"] or "").strip() or None,
             )
             saved.append(f'#{block["scenario_num"]}')
         except Exception as exc:
             failed.append(f'#{block["scenario_num"]}: {exc}')
 
     if saved:
-        st.success(f"✅ Submitted {len(saved)} scenario(s): {', '.join(saved)} — pending trainer review.")
+        st.success(
+            f"✅ Submitted {len(saved)} entr{'ies' if len(saved) > 1 else 'y'} "
+            f"({', '.join(saved)}) — pending trainer review."
+        )
         _pending_count.clear()
         st.balloons()
     for msg in failed:
         st.error(msg)
-    if saved and not failed:
-        st.rerun()
 
 
 # --------------------------------------------------------------------------- #
@@ -727,52 +731,22 @@ def _pending_watch() -> None:
         st.success("✅ Nothing awaiting review.")
 
 
-AWARD_MODES = {
-    "Replace the scenario's score": "replace",
-    "Add to the scenario's score": "add",
-}
-
-
-def _award_mode(key: str) -> str:
-    """Ask whether an award overwrites a scenario's score or adds to it."""
-    label = st.radio(
-        "How should awards apply?",
-        list(AWARD_MODES),
-        horizontal=True,
-        key=key,
-        help=(
-            "Replace — the scenario ends up worth exactly the Award. Use this "
-            "when the submission is the scenario's assessment.\n\n"
-            "Add — the Award is added to whatever the scenario already scored. "
-            "Use this when a scenario is marked in several parts."
-        ),
-    )
-    return AWARD_MODES[label]
-
-
 def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
-    """Award and accept many submissions in one pass."""
+    """Award and accept many attempts in one pass."""
     st.subheader("Bulk review")
+    st.caption(
+        "A scenario's score is the **sum of every accepted attempt**, so a team "
+        "can submit one scenario several times — one per sub-scenario — and you "
+        "can accept as many as make sense. **Scenario total** shows what the "
+        "scenario will score once the ticked rows are posted."
+    )
 
-    mode = _award_mode("bulk_award_mode")
-    if mode == "add":
-        st.caption(
-            "**Add mode** — the scenario's new score is **After = Current + "
-            "Award**. Only the **Award** is added to the team's total. "
-            "**After** must still fit inside the scenario's **Max**."
-        )
-    else:
-        st.caption(
-            "**Replace mode** — the scenario's new score is **After = Award**, "
-            "overwriting **Current**. The team's total moves by "
-            "**Award − Current**, shown as **Δ Total**."
-        )
-
-    recorded = scoring.get_recorded_points()
+    accepted_now = scoring.get_accepted_totals()
     grid = view[["id", "team_id", "team", "scenario_num", "scenario",
-                 "self_points", "max_points"]].copy()
-    grid["Current"] = [
-        recorded.get((int(t), int(s)), 0.0)
+                 "part_label", "self_points", "max_points",
+                 "attempt_no", "final_points", "status"]].copy()
+    grid["Accepted so far"] = [
+        accepted_now.get((int(t), int(s)), 0.0)
         for t, s in zip(grid["team_id"], grid["scenario_num"])
     ]
     grid["Award"] = (
@@ -781,87 +755,87 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
     )
     grid["Accept"] = False
 
-    display = grid[["id", "team", "scenario_num", "scenario", "max_points",
-                    "Current", "Award", "Accept"]].rename(
+    display = grid[["id", "team", "scenario_num", "scenario", "attempt_no",
+                    "part_label", "max_points", "Accepted so far", "Award",
+                    "Accept"]].rename(
         columns={"id": "ID", "team": "Team", "scenario_num": "#",
-                 "scenario": "Scenario", "max_points": "Max"})
+                 "scenario": "Scenario", "attempt_no": "Att",
+                 "part_label": "Part", "max_points": "Max"})
 
     edited = st.data_editor(
         display,
         hide_index=True,
         use_container_width=True,
         key="bulk_review_editor",
-        disabled=["ID", "Team", "#", "Scenario", "Max", "Current"],
+        disabled=["ID", "Team", "#", "Scenario", "Att", "Part", "Max",
+                  "Accepted so far"],
         column_config={
             "Award": st.column_config.NumberColumn("Award", min_value=0, step=1),
             "Accept": st.column_config.CheckboxColumn("Accept"),
         },
     )
 
-    edited = edited.copy()
-    edited["After"] = (
-        edited["Award"] if mode == "replace"
-        else edited["Current"] + edited["Award"]
-    )
-    edited["Δ Total"] = edited["After"] - edited["Current"]
-
-    chosen = edited[edited["Accept"]]
+    chosen = edited[edited["Accept"]].copy()
     if chosen.empty:
         st.caption("Tick **Accept** on the rows you want to post.")
         return
 
-    st.markdown("**Effect of accepting the ticked rows**")
+    # An already-accepted attempt is re-scored rather than added twice, so its
+    # previous contribution must come out of the running total first.
+    prior = grid.set_index("id")
+    chosen["_replaces"] = [
+        float(prior.loc[i, "final_points"] or 0)
+        if prior.loc[i, "status"] == "accepted" else 0.0
+        for i in chosen["ID"]
+    ]
+
+    totals = []
+    for (team, num), rows in chosen.groupby(["Team", "#"]):
+        base = float(rows["Accepted so far"].iloc[0]) - float(rows["_replaces"].sum())
+        totals.append({
+            "Team": team, "#": int(num),
+            "Max": float(rows["Max"].iloc[0]),
+            "Attempts posted": len(rows),
+            "Scenario total": base + float(rows["Award"].sum()),
+            "Was": float(rows["Accepted so far"].iloc[0]),
+        })
+    summary = pd.DataFrame(totals)
+    summary["Δ Total"] = summary["Scenario total"] - summary["Was"]
+
+    st.markdown("**Resulting scenario scores**")
     st.dataframe(
-        chosen[["ID", "Team", "#", "Max", "Current", "Award", "After", "Δ Total"]],
+        summary[["Team", "#", "Attempts posted", "Was", "Scenario total",
+                 "Δ Total", "Max"]],
         hide_index=True, use_container_width=True,
     )
 
-    # A team can attempt a scenario repeatedly, so a batch could contain two
-    # attempts at the same one. Only a single score per team+scenario exists,
-    # so accepting both would silently overwrite (or double-count in Add mode).
-    clashes = chosen.groupby(["Team", "#"]).size()
-    clashes = clashes[clashes > 1]
-    if not clashes.empty:
-        for (team, num), n in clashes.items():
-            st.error(
-                f"{team} has {n} attempts at scenario #{int(num)} ticked. "
-                "Pick the one that should count — they share a single score."
-            )
-        return
-
-    over = chosen[chosen["After"] > chosen["Max"]]
+    over = summary[summary["Scenario total"] > summary["Max"]]
     if not over.empty:
         for _, r in over.iterrows():
-            if mode == "add":
-                sums = (f'{r["Current"]:.0f} already scored + {r["Award"]:.0f} '
-                        f'awarded = {r["After"]:.0f}')
-            else:
-                sums = f'award of {r["Award"]:.0f}'
             st.error(
-                f'#{int(r["#"])} {r["Team"]}: {sums}, which is above this '
-                f'scenario\'s max of {r["Max"]:.0f}. Lower the Award to at most '
-                f'{max(r["Max"] - (r["Current"] if mode == "add" else 0), 0):.0f}, '
-                "or switch to Replace mode."
+                f'{r["Team"]} scenario #{int(r["#"])}: the accepted attempts add '
+                f'up to {r["Scenario total"]:.0f}, above the scenario max of '
+                f'{r["Max"]:.0f}. Lower one of the awards by '
+                f'{r["Scenario total"] - r["Max"]:.0f}.'
             )
         return
 
-    delta = float(chosen["Δ Total"].sum())
     st.info(
-        f"**{len(chosen)}** submission(s) selected · net change to leaderboard "
-        f"points: **{delta:+.0f}**"
+        f"**{len(chosen)}** attempt(s) across **{len(summary)}** scenario(s) · "
+        f"net change to leaderboard points: **{summary['Δ Total'].sum():+.0f}**"
     )
 
     notes = st.text_input("Review note applied to all selected (optional)",
                           key="bulk_notes")
-    if st.button(f"✅ Accept {len(chosen)} submission(s)", type="primary"):
-        awards = {int(r["ID"]): float(r["After"]) for _, r in chosen.iterrows()}
+    if st.button(f"✅ Accept {len(chosen)} attempt(s)", type="primary"):
+        awards = {int(r["ID"]): float(r["Award"]) for _, r in chosen.iterrows()}
         reviewer = st.session_state.get("trainer_name", "Unknown")
         count, errors = scoring.accept_submissions_bulk(
             awards, reviewer, notes.strip() or None)
         _cached_leaderboard.clear()
         _pending_count.clear()
         if count:
-            st.success(f"Accepted {count} submission(s).")
+            st.success(f"Accepted {count} attempt(s).")
         for msg in errors:
             st.error(msg)
         st.rerun()
@@ -895,12 +869,12 @@ def tab_submissions() -> None:
     view = subs[subs["status"].isin(status_filter)] if status_filter else subs
 
     st.dataframe(
-        view[["id", "team", "scenario_num", "scenario", "attempt_no", "status",
-              "self_completed", "self_points", "final_points", "files",
+        view[["id", "team", "scenario_num", "scenario", "attempt_no", "part_label",
+              "status", "self_completed", "self_points", "final_points", "files",
               "submitted_at"]].rename(
             columns={"id": "ID", "team": "Team", "scenario_num": "#",
-                     "scenario": "Scenario", "attempt_no": "Attempt",
-                     "status": "Status",
+                     "scenario": "Scenario", "attempt_no": "Att",
+                     "part_label": "Part", "status": "Status",
                      "self_completed": "Self-complete", "self_points": "Self pts",
                      "final_points": "Awarded", "files": "Files",
                      "submitted_at": "Submitted"}),
@@ -922,6 +896,8 @@ def tab_submissions() -> None:
             f'#{i} · {view.set_index("id").loc[i, "team"]} · '
             f'{view.set_index("id").loc[i, "scenario"]} · '
             f'attempt {int(view.set_index("id").loc[i, "attempt_no"])}'
+            + (f' · {view.set_index("id").loc[i, "part_label"]}'
+               if view.set_index("id").loc[i, "part_label"] else "")
         ),
     ))
 
@@ -938,6 +914,7 @@ def tab_submissions() -> None:
     st.caption(
         f'Status: **{sub["status"]}** · Submitted: {sub["submitted_at"]}'
         + (f' · by {sub["submitted_by"]}' if sub["submitted_by"] else "")
+        + (f' · Part: **{sub["part_label"]}**' if sub.get("part_label") else "")
         + (" · ✅ team marked complete" if sub["self_completed"] else "")
     )
 
@@ -971,53 +948,57 @@ def tab_submissions() -> None:
 
     st.divider()
     reviewer = st.session_state.get("trainer_name", "Unknown")
-    current = float((scoring.get_score(int(sub["team_id"]),
-                                       int(sub["scenario_num"])) or {}).get("points") or 0.0)
-    mode = _award_mode(f"single_award_mode_{sub_id}")
+    accepted_now = scoring.get_accepted_totals().get(
+        (int(sub["team_id"]), int(sub["scenario_num"])), 0.0)
+    # Re-scoring an accepted attempt replaces its own contribution.
+    already = float(sub["final_points"] or 0) if sub["status"] == "accepted" else 0.0
+    others = accepted_now - already
+
     with st.form(f"review_form_{sub_id}"):
         award = st.number_input(
-            "Points to award", min_value=0, max_value=max_points,
+            "Points to award this attempt", min_value=0, max_value=max_points,
             value=min(int(float(sub["self_points"] or 0)), max_points), step=1,
         )
         notes = st.text_area("Review notes (optional)", value=sub["review_notes"] or "")
         accept = st.form_submit_button("✅ Accept & post to leaderboard", type="primary")
 
-    after = float(award) if mode == "replace" else current + float(award)
+    after = others + float(award)
     st.caption(
-        f'This scenario currently scores **{current:.0f}** for {sub["team"]}. '
-        f'Accepting makes it **{after:.0f}**, moving the team total by '
-        f'**{after - current:+.0f}**.'
+        f'Other accepted attempts at this scenario total **{others:.0f}**. '
+        f'Accepting this one makes the scenario score **{after:.0f}** of '
+        f'{max_points} for {sub["team"]}, changing their total by '
+        f'**{after - accepted_now:+.0f}**.'
     )
 
     if accept:
         if after > max_points:
             st.error(
-                f"{current:.0f} already scored + {award:.0f} awarded = "
-                f"{after:.0f}, which is above this scenario's max of "
-                f"{max_points}. Lower the award to at most "
-                f"{max(max_points - (current if mode == 'add' else 0), 0):.0f}, "
-                "or switch to Replace mode."
+                f"{others:.0f} from other accepted attempts + {award:.0f} here "
+                f"= {after:.0f}, above this scenario's max of {max_points}. "
+                f"Lower the award to at most {max(max_points - others, 0):.0f}."
             )
         else:
-            scoring.accept_submission(sub_id, after, reviewer, notes or None)
+            total = scoring.accept_submission(sub_id, float(award), reviewer,
+                                              notes or None)
             _cached_leaderboard.clear()
             _pending_count.clear()
             st.success(
-                f"Accepted — {sub['team']} now scores {after:.0f} on this "
-                f"scenario ({after - current:+.0f} to their total)."
+                f"Accepted — {sub['team']} now scores {total:.0f} on this scenario."
             )
             st.rerun()
 
     a1, a2 = st.columns(2)
     if a1.button("🔄 Reopen for resubmission"):
         scoring.set_submission_status(sub_id, "reopened", reviewer)
+        _cached_leaderboard.clear()
         _pending_count.clear()
         st.success("Reopened — the team can submit again.")
         st.rerun()
-    if a2.button("🚫 Void submission"):
+    if a2.button("🚫 Void this attempt"):
         scoring.set_submission_status(sub_id, "void", reviewer)
+        _cached_leaderboard.clear()
         _pending_count.clear()
-        st.warning("Submission voided.")
+        st.warning("Attempt voided. Any points it contributed have been removed.")
         st.rerun()
 
 
