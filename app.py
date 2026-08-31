@@ -607,7 +607,9 @@ def tab_submit() -> None:
         submitted_by = st.text_input("Submitted by (optional)",
                                      placeholder="Your name")
         # Also at the top: with several scenarios open the form runs to a few
-        # screens, and the button at the bottom is easy to miss.
+        # screens, and the button at the bottom is easy to miss. The labels must
+        # differ - Streamlit derives a form submit button's id from its label,
+        # and two identical ones collide.
         send_top = st.form_submit_button("📤 Submit", type="primary")
         st.divider()
 
@@ -635,7 +637,8 @@ def tab_submit() -> None:
                             _render_scenario_block(n, p, title, max_points))
             st.divider()
 
-        send_bottom = st.form_submit_button("📤 Submit", type="primary")
+        send_bottom = st.form_submit_button("📤 Submit all entries",
+                                            type="primary")
 
     send = send_top or send_bottom
 
