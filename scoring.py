@@ -1104,22 +1104,31 @@ def accept_submission(
     if sub is None:
         raise ValueError(f"Submission {submission_id} not found.")
 
+    team_id = int(sub["team_id"])
+    scenario_num = int(sub["scenario_num"])
+
+    # Submissions never record a time. Carry any existing minutes across:
+    # nulling them would drop this team out of the scenario's speed-bonus
+    # ranking and silently redistribute bonus points to every other team.
+    prior = get_score(team_id, scenario_num) or {}
+    minutes = prior.get("minutes")
+
     upsert_score(
-        team_id=int(sub["team_id"]),
-        scenario_num=int(sub["scenario_num"]),
+        team_id=team_id,
+        scenario_num=scenario_num,
         status="Reviewed",
         points=float(final_points),
-        minutes=None,
+        minutes=minutes,
         passed=float(final_points) > 0,
         notes=notes,
     )
     log_score_entry(
-        team_id=int(sub["team_id"]),
+        team_id=team_id,
         team_name=str(sub["team"]),
-        scenario_num=int(sub["scenario_num"]),
+        scenario_num=scenario_num,
         status="Reviewed",
         points=float(final_points),
-        minutes=None,
+        minutes=minutes,
         passed=float(final_points) > 0,
         notes=notes,
         trainer_name=reviewer,
@@ -1131,6 +1140,105 @@ def accept_submission(
             "UPDATE submissions SET status='accepted', final_points=?, "
             f"reviewed_by=?, reviewed_at={now}, review_notes=? WHERE id=?",
             (float(final_points), reviewer, notes, submission_id))
+
+
+def get_recorded_points() -> dict[tuple[int, int], float]:
+    """(team_id, scenario_num) -> points already on the leaderboard.
+
+    Accepting a submission replaces the scenario's score rather than adding to
+    it, so the review UI needs this to show what a decision will change.
+    """
+    with _connect() as conn:
+        rows = _fetchall(conn, "SELECT team_id, scenario_num, points FROM scores")
+    return {
+        (int(r["team_id"]), int(r["scenario_num"])): float(r["points"] or 0)
+        for r in rows
+    }
+
+
+def accept_submissions_bulk(
+    awards: dict[int, float],
+    reviewer: str,
+    notes: str | None = None,
+) -> tuple[int, list[str]]:
+    """Accept many submissions over a single connection.
+
+    Looping accept_submission() would open several connections per row, which
+    is slow against the Supabase pooler. Returns (accepted_count, errors).
+    """
+    if not awards:
+        return 0, []
+
+    now = _now_sql()
+    accepted = 0
+    errors: list[str] = []
+
+    with _connect() as conn:
+        for sub_id, points in awards.items():
+            row = _fetchone(conn,
+                """SELECT s.team_id, s.scenario_num, t.name AS team
+                   FROM submissions s
+                   JOIN teams t ON t.id = s.team_id
+                   WHERE s.id=?""",
+                (sub_id,))
+            if row is None:
+                errors.append(f"Submission {sub_id} not found.")
+                continue
+
+            team_id = int(row["team_id"])
+            scen = int(row["scenario_num"])
+            points = float(points)
+            passed = 1 if points > 0 else 0
+
+            prior = _fetchone(conn,
+                "SELECT minutes FROM scores WHERE team_id=? AND scenario_num=?",
+                (team_id, scen))
+            minutes = prior["minutes"] if prior else None
+
+            if _is_pg():
+                _execute(conn,
+                    """INSERT INTO scores
+                           (team_id, scenario_num, status, points, minutes,
+                            passed, notes, updated_at)
+                       VALUES (%s, %s, 'Reviewed', %s, %s, %s, %s, NOW())
+                       ON CONFLICT (team_id, scenario_num) DO UPDATE SET
+                           status='Reviewed',
+                           points=EXCLUDED.points,
+                           minutes=EXCLUDED.minutes,
+                           passed=EXCLUDED.passed,
+                           notes=EXCLUDED.notes,
+                           updated_at=NOW()""",
+                    (team_id, scen, points, minutes, passed, notes))
+            else:
+                _execute(conn,
+                    """INSERT INTO scores
+                           (team_id, scenario_num, status, points, minutes,
+                            passed, notes, updated_at)
+                       VALUES (?, ?, 'Reviewed', ?, ?, ?, ?, datetime('now'))
+                       ON CONFLICT(team_id, scenario_num) DO UPDATE SET
+                           status='Reviewed',
+                           points=excluded.points,
+                           minutes=excluded.minutes,
+                           passed=excluded.passed,
+                           notes=excluded.notes,
+                           updated_at=datetime('now')""",
+                    (team_id, scen, points, minutes, passed, notes))
+
+            _execute(conn,
+                "INSERT INTO score_log "
+                "(team_id, team_name, scenario_num, status, points, minutes, "
+                " passed, notes, trainer_name, logged_at) "
+                f"VALUES (?, ?, ?, 'Reviewed', ?, ?, ?, ?, ?, {now})",
+                (team_id, str(row["team"]), scen, points, minutes,
+                 passed, notes, reviewer))
+
+            _execute(conn,
+                "UPDATE submissions SET status='accepted', final_points=?, "
+                f"reviewed_by=?, reviewed_at={now}, review_notes=? WHERE id=?",
+                (points, reviewer, notes, sub_id))
+            accepted += 1
+
+    return accepted, errors
 
 
 def set_submission_status(submission_id: int, status: str, reviewer: str) -> None:
