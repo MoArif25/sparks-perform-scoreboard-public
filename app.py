@@ -294,7 +294,7 @@ def tab_leaderboard() -> None:
 def tab_score_entry() -> None:
     st.header("📝 Score Entry (Trainers)")
     teams = scoring.get_teams()
-    scen = catalog.core_scenarios()
+    scen = _catalog_scenarios()
 
     if teams.empty:
         st.warning("Add teams in the **Setup** tab first.")
@@ -403,6 +403,22 @@ def _parse_options(raw: str | None) -> list[str]:
     return [o.strip() for o in str(raw).split(separator) if o.strip()]
 
 
+# Extra optional part slots shown per scenario, for sub-scenarios.
+EXTRA_PART_SLOTS = 2
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _catalog_scenarios() -> pd.DataFrame:
+    """Shared across sessions, so many teams submitting at once don't each
+    re-read the catalog from Postgres on every rerun. Cleared on catalog save."""
+    return catalog.core_scenarios()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _scenario_items(scenario_num: int) -> pd.DataFrame:
+    return scoring.get_scenario_items(scenario_num)
+
+
 def _render_item(item: pd.Series, key_prefix: str) -> dict:
     """Render one sub-scenario question and return its answer row."""
     label = str(item["label"])
@@ -438,22 +454,24 @@ def _render_item(item: pd.Series, key_prefix: str) -> dict:
     return answer
 
 
-def _render_scenario_block(slot: int, scen_num: int, title: str,
+def _render_scenario_block(scen_num: int, part: int, title: str,
                            max_points: int, scoring_text) -> dict:
-    """Render the inputs for one submission slot and collect its payload."""
-    prefix = f"blk{slot}"
-    caption = f"Max points: **{max_points}**"
-    if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
-        caption += f" · Scoring: *{scoring_text}*"
-    st.caption(caption)
+    """Render one part of one scenario and collect its submission payload."""
+    prefix = f"s{scen_num}_p{part}"
+
+    if part == 0:
+        caption = f"Max points: **{max_points}**"
+        if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
+            caption += f" · Scoring: *{scoring_text}*"
+        st.caption(caption)
 
     part_label = st.text_input(
         "Which part / sub-scenario is this? (optional)",
         key=f"{prefix}_part",
-        placeholder="e.g. PLC code, Simulation, Fault 3 — leave blank for the whole scenario",
+        placeholder="e.g. PLC code, Simulation, Fault 3 — blank means the whole scenario",
     )
 
-    items = scoring.get_scenario_items(scen_num)
+    items = _scenario_items(scen_num)
     answers: list[dict] = []
 
     if items.empty:
@@ -484,16 +502,33 @@ def _render_scenario_block(slot: int, scen_num: int, title: str,
     )
 
     return {
-        "scenario_num": scen_num, "title": title, "answers": answers,
-        "summary": summary, "uploads": uploads or [], "part_label": part_label,
-        "self_completed": self_completed, "self_points": float(self_points),
-        "has_items": not items.empty,
+        "scenario_num": scen_num, "part": part, "title": title,
+        "answers": answers, "summary": summary, "uploads": uploads or [],
+        "part_label": part_label, "self_completed": self_completed,
+        "self_points": float(self_points), "has_items": not items.empty,
     }
+
+
+def _block_is_blank(block: dict) -> bool:
+    """An untouched optional part, which should simply be ignored."""
+    return (
+        not str(block["summary"] or "").strip()
+        and not block["uploads"]
+        and not str(block["part_label"] or "").strip()
+        and not block["self_completed"]
+        and not block["self_points"]
+        and not any(
+            str(a["answer_text"] or "").strip() or a["answer_number"]
+            for a in block["answers"]
+        )
+    )
 
 
 def _validate_block(block: dict) -> str | None:
     """Return an error message for one scenario block, or None if valid."""
     label = f'#{block["scenario_num"]} {block["title"]}'
+    if block["part"]:
+        label += f' (extra part {block["part"]})'
 
     if len(block["uploads"]) > scoring.MAX_FILES_PER_SUBMISSION:
         return f'{label}: attach at most {scoring.MAX_FILES_PER_SUBMISSION} files.'
@@ -523,7 +558,7 @@ def _validate_block(block: dict) -> str | None:
 def tab_submit() -> None:
     st.header("📤 Submit Your Work")
     teams = scoring.get_teams()
-    scen = catalog.core_scenarios()
+    scen = _catalog_scenarios()
 
     if teams.empty:
         st.warning("No teams have been set up yet.")
@@ -552,59 +587,70 @@ def tab_submit() -> None:
                 hide_index=True, use_container_width=True,
             )
 
-    st.caption(
-        "Add one entry per piece of work. You can pick the **same scenario more "
-        "than once** — one entry per sub-scenario — and name each part below. "
-        "A trainer can accept several of them and the points add up."
+    picked = st.multiselect(
+        "Scenarios to submit",
+        options=[int(n) for n in scen["num"].tolist()],
+        format_func=lambda n: f'#{n} — {scen_lookup.loc[n, "title"]}',
+        key="submit_scenarios",
+        help="Pick as many as you like. You can submit the same scenario again later.",
     )
 
-    # Slot count lives outside any form so entries can be added on the fly.
-    if "submit_slots" not in st.session_state:
-        st.session_state["submit_slots"] = 1
-    slots = st.session_state["submit_slots"]
+    if not picked:
+        st.info("Select one or more scenarios above to start.")
+        return
 
-    c1, c2, _ = st.columns([1, 1, 3])
-    if c1.button("➕ Add another entry"):
-        st.session_state["submit_slots"] = slots + 1
-        st.rerun()
-    if c2.button("➖ Remove last", disabled=slots <= 1):
-        for suffix in ("part", "summary", "files", "done", "points"):
-            st.session_state.pop(f"blk{slots - 1}_{suffix}", None)
-        st.session_state["submit_slots"] = slots - 1
-        st.rerun()
+    st.caption(
+        f"Each scenario has room for up to {1 + EXTRA_PART_SLOTS} parts, for when "
+        "one scenario is split into sub-scenarios. Fill in only what you need — "
+        "empty parts are ignored. A trainer can accept several parts and the "
+        "points add up."
+    )
 
-    scen_nums = [int(n) for n in scen["num"].tolist()]
-    blocks = []
-    for i in range(slots):
-        chosen = st.selectbox(
-            f"Entry {i + 1} — scenario",
-            options=scen_nums,
-            format_func=lambda n: f'#{n} — {scen_lookup.loc[n, "title"]}',
-            key=f"blk{i}_scen",
-        )
-        with st.container(border=True):
+    with st.form("submit_form", clear_on_submit=False):
+        blocks = []
+        for n in picked:
+            title = str(scen_lookup.loc[n, "title"])
+            max_points = int(scen_lookup.loc[n, "max_points"])
+            scoring_text = scen_lookup.loc[n, "scoring"]
+
+            st.markdown(f"##### #{n} — {title}")
             blocks.append(_render_scenario_block(
-                i, int(chosen), str(scen_lookup.loc[chosen, "title"]),
-                int(scen_lookup.loc[chosen, "max_points"]),
-                scen_lookup.loc[chosen, "scoring"],
-            ))
+                n, 0, title, max_points, scoring_text))
 
-    st.divider()
-    submitted_by = st.text_input("Submitted by (optional)", key="submit_by",
-                                 placeholder="Your name")
-    if not st.button(f"📤 Submit {slots} entr{'ies' if slots > 1 else 'y'}",
-                     type="primary"):
+            for part in range(1, EXTRA_PART_SLOTS + 1):
+                with st.expander(f"➕ Another part of #{n} (optional)"):
+                    blocks.append(_render_scenario_block(
+                        n, part, title, max_points, scoring_text))
+            st.divider()
+
+        submitted_by = st.text_input("Submitted by (optional)",
+                                     placeholder="Your name")
+        send = st.form_submit_button("📤 Submit", type="primary")
+
+    if not send:
+        return
+
+    filled = [b for b in blocks if not _block_is_blank(b)]
+    if not filled:
+        st.error("Nothing to submit — fill in at least one part.")
+        return
+
+    started = {b["scenario_num"] for b in filled}
+    if missing := [n for n in picked if n not in started]:
+        st.error(
+            "Nothing filled in for " + ", ".join(f"#{n}" for n in missing)
+            + ". Complete it, or deselect it above."
+        )
         return
 
     # Validate everything before writing, so a partial batch never lands.
-    errors = [msg for msg in (_validate_block(b) for b in blocks) if msg]
-    if errors:
+    if errors := [msg for msg in (_validate_block(b) for b in filled) if msg]:
         for msg in errors:
             st.error(msg)
         return
 
     saved, failed = [], []
-    for block in blocks:
+    for block in filled:
         files = [
             {"filename": u.name, "mime_type": u.type, "content": u.getvalue()}
             for u in block["uploads"]
@@ -1095,6 +1141,8 @@ def tab_scenarios(can_edit: bool) -> None:
                             else:
                                 catalog.save_catalog(merged)
                                 _cached_leaderboard.clear()
+                                _catalog_scenarios.clear()
+                                _scenario_items.clear()
                                 st.session_state["catalog_df"] = catalog.load_catalog()
                                 st.session_state["last_csv_import_sig"] = file_sig
                                 st.session_state["csv_import_nonce"] += 1
@@ -1154,6 +1202,8 @@ def tab_scenarios(can_edit: bool) -> None:
             else:
                 catalog.save_catalog(edited)
                 _cached_leaderboard.clear()
+                _catalog_scenarios.clear()
+                _scenario_items.clear()
                 # Ensure other tabs (score entry / leaderboard) re-read the
                 # just-saved catalog in the same user interaction.
                 st.session_state.pop("catalog_df", None)
