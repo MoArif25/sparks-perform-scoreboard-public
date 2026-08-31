@@ -24,7 +24,6 @@ from scenarios import DEFAULT_MAX_POINTS, SCENARIOS
 
 DB_PATH = Path(__file__).with_name("sparks.db")
 
-DEFAULT_TIME_BONUS_TABLE = [5, 3, 2, 1]
 STATUS_OPTIONS = ["Not Started", "In Progress", "Submitted", "Reviewed"]
 
 # Team submission pipeline
@@ -653,20 +652,6 @@ def set_setting(key: str, value: str) -> None:
                 (key, value))
 
 
-def get_time_bonus_table() -> list[int]:
-    raw = get_setting("time_bonus_table")
-    if not raw:
-        return list(DEFAULT_TIME_BONUS_TABLE)
-    try:
-        return [int(x) for x in raw.split(",") if x.strip() != ""]
-    except ValueError:
-        return list(DEFAULT_TIME_BONUS_TABLE)
-
-
-def set_time_bonus_table(values: Iterable[int]) -> None:
-    set_setting("time_bonus_table", ",".join(str(int(v)) for v in values))
-
-
 def get_dashboard_title() -> str:
     return get_setting("dashboard_title") or "SPARK PERFORM Week - Live Leaderboard"
 
@@ -689,36 +674,6 @@ def get_sidebar_subtitle() -> str:
 
 def set_sidebar_subtitle(subtitle: str) -> None:
     set_setting("sidebar_subtitle", subtitle.strip())
-
-
-def speed_bonus_explanation(bonus_table: list[int] | None = None) -> str:
-    if bonus_table is None:
-        bonus_table = get_time_bonus_table()
-
-    def ordinal(n: int) -> str:
-        if n == 1:
-            return "Fastest"
-        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n if n < 20 else n % 10, "th")
-        return f"{n}{suffix} fastest"
-
-    lines = [
-        "**How the speed bonus is allotted**",
-        "",
-        "For *each scenario*, the app looks only at teams whose solution was marked "
-        "**Passed** *and* that have a recorded **time taken**. Those teams are ranked "
-        "from fastest to slowest, and the quickest ones earn extra points:",
-        "",
-    ]
-    for i, v in enumerate(bonus_table, start=1):
-        lines.append(f"- {ordinal(i)} passing team -> **+{v} pts**")
-    lines += [
-        "- Everyone slower (or who did not pass / was not timed) -> **+0 pts**",
-        "",
-        "These bonuses are summed across all scenarios and added to the reviewer "
-        "points to form each team's **Total**. If two teams have the same total, the "
-        "team with the lower **overall time** ranks higher (tiebreaker).",
-    ]
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1366,66 +1321,33 @@ def delete_all_submissions() -> None:
 # ---------------------------------------------------------------------------
 # Scoring computation
 # ---------------------------------------------------------------------------
-def compute_time_bonus(scores: pd.DataFrame, bonus_table: list[int]) -> pd.DataFrame:
-    scores = scores.copy()
-    scores["time_bonus"] = 0.0
-    for scen_num in scores["scenario_num"].unique():
-        mask = (
-            (scores["scenario_num"] == scen_num)
-            & (scores["passed"] == 1)
-            & (scores["minutes"].notna())
-            & (scores["minutes"] > 0)
-        )
-        eligible = scores.loc[mask].sort_values("minutes")
-        for rank, idx in enumerate(eligible.index):
-            if rank < len(bonus_table):
-                scores.at[idx, "time_bonus"] = float(bonus_table[rank])
-    return scores
+def build_leaderboard() -> pd.DataFrame:
+    """Rank teams by reviewer points.
 
-
-def build_leaderboard(bonus_table: list[int] | None = None) -> pd.DataFrame:
-    # Read everything we need over a SINGLE connection. Previously this opened
-    # three separate connections (settings, teams, scores); on Supabase each
-    # new pooled connection adds a network round-trip, and doing that on every
-    # 15s live refresh caused latency spikes and visible flicker.
+    Teams work through scenarios asynchronously, so nothing is timed and there
+    is no speed bonus. Ties break on scenarios completed, then team name, so
+    the order is stable rather than dependent on unrecorded times.
+    """
+    # Read over a SINGLE connection: on Supabase each new pooled connection
+    # adds a round trip, and this runs on every 15s live refresh.
     with _connect() as conn:
-        if bonus_table is None:
-            row = _fetchone(conn,
-                "SELECT value FROM settings WHERE key=?", ("time_bonus_table",))
-            raw = row["value"] if row else None
-            if raw:
-                try:
-                    bonus_table = [int(x) for x in raw.split(",") if x.strip() != ""]
-                except ValueError:
-                    bonus_table = list(DEFAULT_TIME_BONUS_TABLE)
-            else:
-                bonus_table = list(DEFAULT_TIME_BONUS_TABLE)
-
         teams = _read_sql("SELECT id, name FROM teams ORDER BY name", conn)
         scores = _read_sql(
             """SELECT s.team_id, t.name AS team, s.scenario_num,
-                      s.status, s.points, s.minutes, s.passed
+                      s.status, s.points
                FROM scores s
                JOIN teams t ON t.id = s.team_id
                ORDER BY s.scenario_num, t.name""",
             conn)
 
-    scores = compute_time_bonus(scores, bonus_table)
-
     rows = []
     for _, team in teams.iterrows():
         t = scores[scores["team_id"] == team["id"]]
         completed = t[t["status"] == "Reviewed"]
-        base = float(t["points"].sum())
-        bonus = float(t["time_bonus"].sum())
-        total_minutes = float(t["minutes"].fillna(0).sum())
         rows.append({
             "team": team["name"],
-            "base_points": round(base, 1),
-            "time_bonus": round(bonus, 1),
-            "total_points": round(base + bonus, 1),
+            "total_points": round(float(t["points"].sum()), 1),
             "scenarios_completed": int(len(completed)),
-            "total_minutes": round(total_minutes, 1),
         })
 
     lb = pd.DataFrame(rows)
@@ -1433,8 +1355,8 @@ def build_leaderboard(bonus_table: list[int] | None = None) -> pd.DataFrame:
         return lb
 
     lb = lb.sort_values(
-        by=["total_points", "total_minutes"],
-        ascending=[False, True],
+        by=["total_points", "scenarios_completed", "team"],
+        ascending=[False, False, True],
     ).reset_index(drop=True)
     lb.insert(0, "rank", lb.index + 1)
     return lb

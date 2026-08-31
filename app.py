@@ -169,8 +169,7 @@ def _cached_leaderboard():
     """Cache leaderboard reads so live refreshes don't hit the database on
     every redraw. TTL sits just under the refresh interval so each cycle makes
     at most one round trip. Cleared immediately when a score is saved."""
-    bonus_table = scoring.get_time_bonus_table()
-    return scoring.build_leaderboard(bonus_table)
+    return scoring.build_leaderboard()
 
 
 def _standings_html(lb: pd.DataFrame) -> str:
@@ -208,10 +207,8 @@ def _standings_html(lb: pd.DataFrame) -> str:
             "<tr>"
             f'<td style="padding:0.35rem 0.5rem;white-space:nowrap;">{medal} {rank}</td>'
             f'<td style="padding:0.35rem 0.5rem;font-weight:600;">{escape(str(r["team"]))}</td>'
-            f'<td style="padding:0.35rem 0.5rem;text-align:right;">{r["base_points"]:.0f}</td>'
-            f'<td style="padding:0.35rem 0.5rem;text-align:right;">{r["time_bonus"]:.0f}</td>'
             f'<td style="padding:0.35rem 0.5rem;text-align:right;font-weight:700;">{r["total_points"]:.0f}</td>'
-            '<td style="padding:0.35rem 0.5rem;width:38%;">'
+            '<td style="padding:0.35rem 0.5rem;width:45%;">'
             '<div style="background:rgba(128,128,128,0.18);border-radius:0.35rem;height:0.65rem;">'
             f'<div style="width:{pct:.1f}%;background:#21c354;height:100%;border-radius:0.35rem;"></div>'
             "</div></td>"
@@ -219,7 +216,7 @@ def _standings_html(lb: pd.DataFrame) -> str:
             "</tr>"
         )
 
-    headers = ["Rank", "Team", "Reviewer pts", "Speed bonus", "Total", "", "Done"]
+    headers = ["Rank", "Team", "Points", "", "Done"]
     header_html = "".join(
         '<th style="padding:0.4rem 0.5rem;text-align:left;font-size:0.8rem;'
         f'opacity:0.7;border-bottom:1px solid rgba(128,128,128,0.3);">{h}</th>'
@@ -254,13 +251,20 @@ def render_leaderboard_extras() -> None:
         return
 
     st.subheader("Points by team")
-    chart_df = lb.set_index("team")[["base_points", "time_bonus"]].rename(
-        columns={"base_points": "Reviewer pts", "time_bonus": "Speed bonus"}
+    chart_df = lb.set_index("team")[["total_points"]].rename(
+        columns={"total_points": "Points"}
     )
-    st.bar_chart(chart_df, color=["#1f77b4", "#ff7f0e"])
+    st.bar_chart(chart_df, color="#1f77b4")
 
-    with st.expander("ℹ️ How scoring & the speed bonus work"):
-        st.markdown(scoring.speed_bonus_explanation())
+    with st.expander("ℹ️ How scoring works"):
+        st.markdown(
+            "- A team's **Points** are the reviewer points awarded across every "
+            "scenario.\n"
+            "- Teams work through scenarios in their own order and at their own "
+            "pace, so nothing is timed and there is no speed bonus.\n"
+            "- **Done** counts scenarios that have been reviewed.\n"
+            "- Equal points are broken by scenarios completed, then team name."
+        )
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
@@ -329,43 +333,35 @@ def tab_score_entry() -> None:
             index=scoring.STATUS_OPTIONS.index(existing.get("status", "Not Started")),
         )
         passed = fc2.checkbox(
-            "Solution passed (eligible for speed bonus)",
+            "Solution passed",
             value=bool(existing.get("passed", 0)),
         )
         points = fc1.number_input(
             "Reviewer points", min_value=0, max_value=max_points,
             value=min(int(existing.get("points", 0) or 0), max_points), step=1,
         )
-        minutes = fc2.number_input(
-            "Time taken (minutes)", min_value=0.0,
-            value=float(existing["minutes"]) if existing.get("minutes") is not None else 0.0,
-            step=1.0,
-            help="Used for the speed bonus and as the tiebreaker. Leave 0 if not timed.",
-        )
         notes = st.text_area("Notes (optional)", value=existing.get("notes", "") or "")
         submitted = st.form_submit_button("💾 Save score", type="primary")
 
     if submitted:
-        # Get trainer name from session
         trainer_name = st.session_state.get("trainer_name", "Unknown")
         team_name = teams.set_index("id").loc[team_id, "name"]
-        
+
+        # Preserve any historical time rather than clearing it on every save.
+        minutes = existing.get("minutes")
+
         scoring.upsert_score(
             team_id=team_id, scenario_num=int(scen_num), status=status,
-            points=points, minutes=None if minutes == 0 else minutes,
+            points=points, minutes=minutes,
             passed=passed, notes=notes,
         )
-        # Log the score entry to audit trail
         scoring.log_score_entry(
             team_id=team_id, team_name=team_name, scenario_num=int(scen_num),
-            status=status, points=points, minutes=None if minutes == 0 else minutes,
+            status=status, points=points, minutes=minutes,
             passed=passed, notes=notes, trainer_name=trainer_name,
         )
         _cached_leaderboard.clear()
         st.success("Saved. The leaderboard updates on its next refresh.")
-
-    with st.expander("ℹ️ How the speed bonus is allotted"):
-        st.markdown(scoring.speed_bonus_explanation())
 
     st.subheader("This scenario — all teams (score snapshot)")
     st.caption("This table is filtered by the currently selected scenario and is not the audit log.")
@@ -374,9 +370,9 @@ def tab_score_entry() -> None:
     if this_scen.empty:
         st.caption("No scores recorded for this scenario yet.")
     else:
-        view = this_scen[["team", "status", "points", "minutes", "passed", "notes"]].rename(
+        view = this_scen[["team", "status", "points", "passed", "notes"]].rename(
             columns={"team": "Team", "status": "Status", "points": "Points",
-                     "minutes": "Minutes", "passed": "Passed", "notes": "Notes"}
+                     "passed": "Passed", "notes": "Notes"}
         )
         view["Passed"] = view["Passed"].map({1: "✅", 0: ""})
         st.dataframe(view, hide_index=True, use_container_width=True)
@@ -1256,24 +1252,6 @@ def tab_setup() -> None:
         scoring.set_sidebar_subtitle(new_sb_subtitle)
         st.success("Sidebar branding updated. Refresh to see changes.")
         st.rerun()
-
-    st.divider()
-    st.subheader("Speed bonus")
-    st.markdown(scoring.speed_bonus_explanation())
-    current = scoring.get_time_bonus_table()
-    bonus_text = st.text_input(
-        "Bonus points by finishing position (comma-separated)",
-        value=", ".join(str(v) for v in current),
-        help="Example: 5, 3, 2, 1 means +5 fastest, +3 second, +2 third, +1 fourth.",
-    )
-    if st.button("Save speed bonus"):
-        try:
-            values = [int(x.strip()) for x in bonus_text.split(",") if x.strip()]
-            scoring.set_time_bonus_table(values)
-            st.success(f"Speed bonus saved: {values}")
-            st.rerun()
-        except ValueError:
-            st.error("Please enter whole numbers separated by commas.")
 
     st.divider()
     st.subheader("Trainer password")
