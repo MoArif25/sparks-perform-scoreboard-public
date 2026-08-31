@@ -708,20 +708,44 @@ def _render_submission_archive() -> None:
         )
 
 
+AWARD_MODES = {
+    "Replace the scenario's score": "replace",
+    "Add to the scenario's score": "add",
+}
+
+
+def _award_mode(key: str) -> str:
+    """Ask whether an award overwrites a scenario's score or adds to it."""
+    label = st.radio(
+        "How should awards apply?",
+        list(AWARD_MODES),
+        horizontal=True,
+        key=key,
+        help=(
+            "Replace — the scenario ends up worth exactly the Award. Use this "
+            "when the submission is the scenario's assessment.\n\n"
+            "Add — the Award is added to whatever the scenario already scored. "
+            "Use this when a scenario is marked in several parts."
+        ),
+    )
+    return AWARD_MODES[label]
+
+
 def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
     """Award and accept many submissions in one pass."""
     st.subheader("Bulk review")
+
+    mode = _award_mode("bulk_award_mode")
     st.caption(
-        "Set **Award** for each row, tick **Accept**, then post them all at once. "
-        "**Now** is the scenario's current score and **Change** is what accepting "
-        "does to the team's total — accepting *replaces* a scenario's score, it "
-        "does not add to it."
+        "**Current** is what the scenario scores today · **Award** is your "
+        "decision · **After** is what the scenario will score once accepted · "
+        "**Δ Total** is how the team's overall total moves."
     )
 
     recorded = scoring.get_recorded_points()
     grid = view[["id", "team_id", "team", "scenario_num", "scenario",
                  "self_points", "max_points"]].copy()
-    grid["Now"] = [
+    grid["Current"] = [
         recorded.get((int(t), int(s)), 0.0)
         for t, s in zip(grid["team_id"], grid["scenario_num"])
     ]
@@ -729,11 +753,10 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
         grid["self_points"].fillna(0).astype(float)
         .combine(grid["max_points"].astype(float), min)
     )
-    grid["Change"] = grid["Award"] - grid["Now"]
     grid["Accept"] = False
 
     display = grid[["id", "team", "scenario_num", "scenario", "max_points",
-                    "Now", "Award", "Change", "Accept"]].rename(
+                    "Current", "Award", "Accept"]].rename(
         columns={"id": "ID", "team": "Team", "scenario_num": "#",
                  "scenario": "Scenario", "max_points": "Max"})
 
@@ -742,28 +765,41 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
         hide_index=True,
         use_container_width=True,
         key="bulk_review_editor",
-        disabled=["ID", "Team", "#", "Scenario", "Max", "Now", "Change"],
+        disabled=["ID", "Team", "#", "Scenario", "Max", "Current"],
         column_config={
             "Award": st.column_config.NumberColumn("Award", min_value=0, step=1),
             "Accept": st.column_config.CheckboxColumn("Accept"),
         },
     )
 
+    edited = edited.copy()
+    edited["After"] = (
+        edited["Award"] if mode == "replace"
+        else edited["Current"] + edited["Award"]
+    )
+    edited["Δ Total"] = edited["After"] - edited["Current"]
+
     chosen = edited[edited["Accept"]]
     if chosen.empty:
         st.caption("Tick **Accept** on the rows you want to post.")
         return
 
-    over = chosen[chosen["Award"] > chosen["Max"]]
+    st.markdown("**Effect of accepting the ticked rows**")
+    st.dataframe(
+        chosen[["ID", "Team", "#", "Max", "Current", "Award", "After", "Δ Total"]],
+        hide_index=True, use_container_width=True,
+    )
+
+    over = chosen[chosen["After"] > chosen["Max"]]
     if not over.empty:
         for _, r in over.iterrows():
             st.error(
-                f'#{int(r["#"])} {r["Team"]}: award {r["Award"]:.0f} exceeds the '
-                f'scenario max of {r["Max"]:.0f}.'
+                f'#{int(r["#"])} {r["Team"]}: that would score '
+                f'{r["After"]:.0f}, above the scenario max of {r["Max"]:.0f}.'
             )
         return
 
-    delta = float((chosen["Award"] - chosen["Now"]).sum())
+    delta = float(chosen["Δ Total"].sum())
     st.info(
         f"**{len(chosen)}** submission(s) selected · net change to leaderboard "
         f"points: **{delta:+.0f}**"
@@ -772,7 +808,7 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
     notes = st.text_input("Review note applied to all selected (optional)",
                           key="bulk_notes")
     if st.button(f"✅ Accept {len(chosen)} submission(s)", type="primary"):
-        awards = {int(r["ID"]): float(r["Award"]) for _, r in chosen.iterrows()}
+        awards = {int(r["ID"]): float(r["After"]) for _, r in chosen.iterrows()}
         reviewer = st.session_state.get("trainer_name", "Unknown")
         count, errors = scoring.accept_submissions_bulk(
             awards, reviewer, notes.strip() or None)
@@ -879,26 +915,38 @@ def tab_submissions() -> None:
 
     st.divider()
     reviewer = st.session_state.get("trainer_name", "Unknown")
-    current = (scoring.get_score(int(sub["team_id"]), int(sub["scenario_num"]))
-               or {}).get("points") or 0.0
+    current = float((scoring.get_score(int(sub["team_id"]),
+                                       int(sub["scenario_num"])) or {}).get("points") or 0.0)
+    mode = _award_mode(f"single_award_mode_{sub_id}")
     with st.form(f"review_form_{sub_id}"):
         award = st.number_input(
             "Points to award", min_value=0, max_value=max_points,
             value=min(int(float(sub["self_points"] or 0)), max_points), step=1,
         )
-        st.caption(
-            f'This scenario currently scores **{float(current):.0f}** for '
-            f'{sub["team"]}. Accepting replaces that value rather than adding '
-            f'to it, so the team total moves by **{award - float(current):+.0f}**.'
-        )
         notes = st.text_area("Review notes (optional)", value=sub["review_notes"] or "")
         accept = st.form_submit_button("✅ Accept & post to leaderboard", type="primary")
 
+    after = float(award) if mode == "replace" else current + float(award)
+    st.caption(
+        f'This scenario currently scores **{current:.0f}** for {sub["team"]}. '
+        f'Accepting makes it **{after:.0f}**, moving the team total by '
+        f'**{after - current:+.0f}**.'
+    )
+
     if accept:
-        scoring.accept_submission(sub_id, float(award), reviewer, notes or None)
-        _cached_leaderboard.clear()
-        st.success(f"Accepted — {award:.0f} pts posted for {sub['team']}.")
-        st.rerun()
+        if after > max_points:
+            st.error(
+                f"That would score {after:.0f}, above the scenario max of "
+                f"{max_points}."
+            )
+        else:
+            scoring.accept_submission(sub_id, after, reviewer, notes or None)
+            _cached_leaderboard.clear()
+            st.success(
+                f"Accepted — {sub['team']} now scores {after:.0f} on this "
+                f"scenario ({after - current:+.0f} to their total)."
+            )
+            st.rerun()
 
     a1, a2 = st.columns(2)
     if a1.button("🔄 Reopen for resubmission"):
