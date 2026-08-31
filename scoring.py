@@ -495,7 +495,6 @@ def init_db() -> None:
                     reviewed_by    TEXT,
                     reviewed_at    TIMESTAMPTZ,
                     review_notes   TEXT,
-                    UNIQUE (team_id, scenario_num),
                     FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
                 )""",
                 """CREATE TABLE IF NOT EXISTS submission_answers (
@@ -601,7 +600,6 @@ def init_db() -> None:
                     reviewed_by    TEXT,
                     reviewed_at    TEXT,
                     review_notes   TEXT,
-                    UNIQUE (team_id, scenario_num),
                     FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS submission_answers (
@@ -627,6 +625,58 @@ def init_db() -> None:
                 );
                 """
             )
+
+        _migrate_allow_repeat_attempts(conn)
+
+
+def _migrate_allow_repeat_attempts(conn) -> None:
+    """Drop the old one-submission-per-team-per-scenario constraint.
+
+    Teams may now submit a scenario as many times as they like, so the
+    UNIQUE (team_id, scenario_num) constraint created by earlier versions has
+    to come off existing databases.
+    """
+    if _is_pg():
+        for row in _fetchall(conn,
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = 'submissions'::regclass AND contype = 'u'"):
+            _execute(conn,
+                f'ALTER TABLE submissions DROP CONSTRAINT "{row["conname"]}"')
+        return
+
+    # SQLite cannot drop a constraint, so rebuild the table without it.
+    indexes = _fetchall(conn, "PRAGMA index_list(submissions)")
+    if not any(str(i.get("origin")) == "u" for i in indexes):
+        return
+
+    conn.executescript(
+        """
+        ALTER TABLE submissions RENAME TO submissions_legacy;
+        CREATE TABLE submissions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id        INTEGER NOT NULL,
+            scenario_num   INTEGER NOT NULL,
+            attempt_no     INTEGER NOT NULL DEFAULT 1,
+            status         TEXT NOT NULL DEFAULT 'submitted',
+            summary        TEXT,
+            self_completed INTEGER NOT NULL DEFAULT 0,
+            self_points    REAL,
+            auto_points    REAL,
+            final_points   REAL,
+            submitted_by   TEXT,
+            submitted_at   TEXT DEFAULT (datetime('now')),
+            reviewed_by    TEXT,
+            reviewed_at    TEXT,
+            review_notes   TEXT,
+            FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
+        );
+        INSERT INTO submissions SELECT id, team_id, scenario_num, attempt_no,
+               status, summary, self_completed, self_points, auto_points,
+               final_points, submitted_by, submitted_at, reviewed_by,
+               reviewed_at, review_notes FROM submissions_legacy;
+        DROP TABLE submissions_legacy;
+        """
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -912,9 +962,11 @@ def count_scenario_items() -> int:
 # Team submissions
 # ---------------------------------------------------------------------------
 def get_submission_for(team_id: int, scenario_num: int) -> dict | None:
+    """The team's most recent attempt at a scenario."""
     with _connect() as conn:
         return _fetchone(conn,
-            "SELECT * FROM submissions WHERE team_id=? AND scenario_num=?",
+            "SELECT * FROM submissions WHERE team_id=? AND scenario_num=? "
+            "ORDER BY attempt_no DESC, id DESC",
             (team_id, scenario_num))
 
 
@@ -928,7 +980,10 @@ def save_submission(
     answers: list[dict],
     files: list[dict],
 ) -> int:
-    """Create the team's submission, or replace it if a trainer reopened it.
+    """Record a new attempt at a scenario.
+
+    Teams may submit the same scenario repeatedly; every attempt is kept as its
+    own row so trainers can see the full history.
 
     ``answers`` items carry ``item_id``, ``label``, ``answer_text`` and
     ``answer_number``. ``files`` items carry ``filename``, ``mime_type`` and
@@ -936,32 +991,19 @@ def save_submission(
     """
     now = _now_sql()
     with _connect() as conn:
-        existing = _fetchone(conn,
-            "SELECT id, attempt_no, status FROM submissions "
+        row = _fetchone(conn,
+            "SELECT COALESCE(MAX(attempt_no), 0) AS last FROM submissions "
             "WHERE team_id=? AND scenario_num=?",
             (team_id, scenario_num))
+        attempt_no = int(row["last"] if row else 0) + 1
 
-        if existing is None:
-            sub_id = _insert_returning_id(conn,
-                "INSERT INTO submissions "
-                "(team_id, scenario_num, attempt_no, status, summary, "
-                " self_completed, self_points, submitted_by, submitted_at) "
-                f"VALUES (?, ?, 1, 'submitted', ?, ?, ?, ?, {now})",
-                (team_id, scenario_num, summary,
-                 1 if self_completed else 0, self_points, submitted_by))
-        else:
-            if existing["status"] in ("submitted", "accepted"):
-                raise ValueError("This team has already submitted this scenario.")
-            sub_id = int(existing["id"])
-            _execute(conn,
-                "UPDATE submissions SET attempt_no=?, status='submitted', summary=?, "
-                "self_completed=?, self_points=?, submitted_by=?, "
-                f"submitted_at={now}, reviewed_by=NULL, reviewed_at=NULL, "
-                "review_notes=NULL, final_points=NULL WHERE id=?",
-                (int(existing["attempt_no"]) + 1, summary,
-                 1 if self_completed else 0, self_points, submitted_by, sub_id))
-            _execute(conn, "DELETE FROM submission_answers WHERE submission_id=?", (sub_id,))
-            _execute(conn, "DELETE FROM submission_files WHERE submission_id=?", (sub_id,))
+        sub_id = _insert_returning_id(conn,
+            "INSERT INTO submissions "
+            "(team_id, scenario_num, attempt_no, status, summary, "
+            " self_completed, self_points, submitted_by, submitted_at) "
+            f"VALUES (?, ?, ?, 'submitted', ?, ?, ?, ?, {now})",
+            (team_id, scenario_num, attempt_no, summary,
+             1 if self_completed else 0, self_points, submitted_by))
 
         for a in answers:
             _execute(conn,
@@ -1216,13 +1258,30 @@ def set_submission_status(submission_id: int, status: str, reviewer: str) -> Non
             (status, reviewer, submission_id))
 
 
-def get_team_submission_map(team_id: int) -> dict[int, str]:
-    """Scenario number -> submission status for one team."""
+def get_team_attempts(team_id: int) -> pd.DataFrame:
+    """Every attempt a team has made, newest first, for the submit form."""
+    with _connect() as conn:
+        return _read_sql(
+            "SELECT s.scenario_num, "
+            "       COALESCE(sc.title, 'Scenario #' || CAST(s.scenario_num AS TEXT)) "
+            "           AS scenario, "
+            "       s.attempt_no, s.status, s.final_points, "
+            "       CAST(s.submitted_at AS TEXT) AS submitted_at "
+            "FROM submissions s "
+            "LEFT JOIN scenarios sc ON sc.num = s.scenario_num "
+            f"WHERE s.team_id = {int(team_id)} "
+            "ORDER BY s.scenario_num, s.attempt_no DESC",
+            conn)
+
+
+def get_attempt_counts(team_id: int) -> dict[int, int]:
+    """scenario_num -> how many times this team has submitted it."""
     with _connect() as conn:
         rows = _fetchall(conn,
-            "SELECT scenario_num, status FROM submissions WHERE team_id=?",
+            "SELECT scenario_num, COUNT(*) AS n FROM submissions "
+            "WHERE team_id=? GROUP BY scenario_num",
             (team_id,))
-    return {int(r["scenario_num"]): str(r["status"]) for r in rows}
+    return {int(r["scenario_num"]): int(r["n"]) for r in rows}
 
 
 def export_submissions() -> pd.DataFrame:

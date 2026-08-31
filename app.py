@@ -438,11 +438,6 @@ def _render_item(item: pd.Series, key_prefix: str) -> dict:
     return answer
 
 
-_LOCKED_STATUSES = {"submitted": "✅ Submitted — pending review",
-                    "accepted": "🏅 Reviewed and scored",
-                    "void": "🚫 Voided by a trainer"}
-
-
 def _render_scenario_block(scen_num: int, title: str, max_points: int,
                            scoring_text) -> dict:
     """Render the inputs for one scenario and collect its submission payload."""
@@ -539,40 +534,44 @@ def tab_submit() -> None:
         key="submit_team",
     ))
 
-    status_map = scoring.get_team_submission_map(team_id)
-    locked = {n: s for n, s in status_map.items() if s in _LOCKED_STATUSES}
-    available = [int(n) for n in scen["num"].tolist() if int(n) not in locked]
+    attempts = scoring.get_team_attempts(team_id)
+    counts = scoring.get_attempt_counts(team_id)
 
-    if locked:
-        with st.expander(f"📋 Your team's submitted scenarios ({len(locked)})"):
-            rows = [
-                {"Scenario": f'#{n} — {scen_lookup.loc[n, "title"]}'
-                            if n in scen_lookup.index else f"#{n}",
-                 "Status": _LOCKED_STATUSES[s]}
-                for n, s in sorted(locked.items())
-            ]
-            st.dataframe(pd.DataFrame(rows), hide_index=True,
-                         use_container_width=True)
+    if not attempts.empty:
+        with st.expander(f"📋 Your team's previous attempts ({len(attempts)})"):
+            st.dataframe(
+                attempts.rename(columns={
+                    "scenario_num": "#", "scenario": "Scenario",
+                    "attempt_no": "Attempt", "status": "Status",
+                    "final_points": "Awarded", "submitted_at": "Submitted"}),
+                hide_index=True, use_container_width=True,
+            )
 
-    if not available:
-        st.success("🎉 Your team has submitted every scenario.")
-        return
+    def _label(n: int) -> str:
+        title = scen_lookup.loc[n, "title"]
+        tries = counts.get(int(n), 0)
+        suffix = f"  ·  {tries} attempt{'s' if tries > 1 else ''} so far" if tries else ""
+        return f'#{n} — {title}{suffix}'
 
     picked = st.multiselect(
         "Scenarios to submit",
-        options=available,
-        format_func=lambda n: f'#{n} — {scen_lookup.loc[n, "title"]}',
+        options=[int(n) for n in scen["num"].tolist()],
+        format_func=_label,
         key="submit_scenarios",
-        help="Pick one or several. Each scenario is submitted once.",
+        help="Pick one or several. You can submit a scenario as many times as you like.",
     )
 
     if not picked:
         st.info("Select one or more scenarios above to start.")
         return
 
-    reopened = [n for n in picked if status_map.get(n) == "reopened"]
-    if reopened:
-        st.info(f"🔄 Reopened by a trainer — you can submit again: {reopened}")
+    repeats = [n for n in picked if counts.get(n)]
+    if repeats:
+        st.info(
+            "🔁 You have already submitted "
+            + ", ".join(f"#{n}" for n in repeats)
+            + ". Submitting again adds a new attempt; a trainer decides which one counts."
+        )
 
     with st.form("submit_form", clear_on_submit=False):
         blocks = []
@@ -817,6 +816,19 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
         hide_index=True, use_container_width=True,
     )
 
+    # A team can attempt a scenario repeatedly, so a batch could contain two
+    # attempts at the same one. Only a single score per team+scenario exists,
+    # so accepting both would silently overwrite (or double-count in Add mode).
+    clashes = chosen.groupby(["Team", "#"]).size()
+    clashes = clashes[clashes > 1]
+    if not clashes.empty:
+        for (team, num), n in clashes.items():
+            st.error(
+                f"{team} has {n} attempts at scenario #{int(num)} ticked. "
+                "Pick the one that should count — they share a single score."
+            )
+        return
+
     over = chosen[chosen["After"] > chosen["Max"]]
     if not over.empty:
         for _, r in over.iterrows():
@@ -883,10 +895,12 @@ def tab_submissions() -> None:
     view = subs[subs["status"].isin(status_filter)] if status_filter else subs
 
     st.dataframe(
-        view[["id", "team", "scenario_num", "scenario", "status", "self_completed",
-              "self_points", "final_points", "files", "submitted_at"]].rename(
+        view[["id", "team", "scenario_num", "scenario", "attempt_no", "status",
+              "self_completed", "self_points", "final_points", "files",
+              "submitted_at"]].rename(
             columns={"id": "ID", "team": "Team", "scenario_num": "#",
-                     "scenario": "Scenario", "status": "Status",
+                     "scenario": "Scenario", "attempt_no": "Attempt",
+                     "status": "Status",
                      "self_completed": "Self-complete", "self_points": "Self pts",
                      "final_points": "Awarded", "files": "Files",
                      "submitted_at": "Submitted"}),
@@ -906,7 +920,8 @@ def tab_submissions() -> None:
         options=view["id"].tolist(),
         format_func=lambda i: (
             f'#{i} · {view.set_index("id").loc[i, "team"]} · '
-            f'{view.set_index("id").loc[i, "scenario"]}'
+            f'{view.set_index("id").loc[i, "scenario"]} · '
+            f'attempt {int(view.set_index("id").loc[i, "attempt_no"])}'
         ),
     ))
 
