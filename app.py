@@ -465,7 +465,7 @@ def _render_scenario_block(scen_num: int, part: int, title: str,
 
     if items.empty:
         summary = st.text_area(
-            "What did your team do?", height=140, key=f"{prefix}_summary",
+            "What did your team do?", height=90, key=f"{prefix}_summary",
             placeholder="Describe your approach, what you configured, and the result",
         )
     else:
@@ -597,12 +597,20 @@ def tab_submit() -> None:
     # Outside the form so raising it takes effect immediately; inside the form
     # it could not change the number of rendered tabs.
     part_slots = int(st.number_input(
-        "Parts per scenario", min_value=1, max_value=25, value=3, step=1,
+        "Parts per scenario", min_value=1, max_value=25, value=1, step=1,
         key="submit_part_slots",
-        help="Raise this if a scenario has more sub-scenarios than tabs shown.",
+        help="Only raise this if a scenario is split into sub-scenarios. Each "
+             "extra part makes the form longer.",
     ))
 
     with st.form("submit_form", clear_on_submit=False):
+        submitted_by = st.text_input("Submitted by (optional)",
+                                     placeholder="Your name")
+        # Also at the top: with several scenarios open the form runs to a few
+        # screens, and the button at the bottom is easy to miss.
+        send_top = st.form_submit_button("📤 Submit", type="primary")
+        st.divider()
+
         blocks = []
         for n in picked:
             title = str(scen_lookup.loc[n, "title"])
@@ -627,9 +635,9 @@ def tab_submit() -> None:
                             _render_scenario_block(n, p, title, max_points))
             st.divider()
 
-        submitted_by = st.text_input("Submitted by (optional)",
-                                     placeholder="Your name")
-        send = st.form_submit_button("📤 Submit", type="primary")
+        send_bottom = st.form_submit_button("📤 Submit", type="primary")
+
+    send = send_top or send_bottom
 
     if not send:
         return
