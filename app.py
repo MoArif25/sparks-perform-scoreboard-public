@@ -629,6 +629,7 @@ def tab_submit() -> None:
 
     if saved:
         st.success(f"✅ Submitted {len(saved)} scenario(s): {', '.join(saved)} — pending trainer review.")
+        _pending_count.clear()
         st.balloons()
     for msg in failed:
         st.error(msg)
@@ -706,6 +707,29 @@ def _render_submission_archive() -> None:
             "Take these exports at the end of each event — they are your backup "
             "and the only copy if the database is later purged."
         )
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _pending_count() -> int:
+    return scoring.count_pending_submissions()
+
+
+@st.fragment(run_every=20)
+def _pending_watch() -> None:
+    """Poll only the pending count.
+
+    The submissions list itself is deliberately left static: it contains a
+    data_editor, and rerunning that on a timer would discard awards a trainer
+    is part-way through typing.
+    """
+    n = _pending_count()
+    if n:
+        st.warning(
+            f"🔔 **{n}** submission(s) awaiting review. "
+            "Press **Refresh list** to load the latest."
+        )
+    else:
+        st.success("✅ Nothing awaiting review.")
 
 
 AWARD_MODES = {
@@ -813,6 +837,7 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
         count, errors = scoring.accept_submissions_bulk(
             awards, reviewer, notes.strip() or None)
         _cached_leaderboard.clear()
+        _pending_count.clear()
         if count:
             st.success(f"Accepted {count} submission(s).")
         for msg in errors:
@@ -822,6 +847,12 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
 
 def tab_submissions() -> None:
     st.header("📥 Submissions Inbox")
+
+    _pending_watch()
+    if st.button("🔄 Refresh list"):
+        _pending_count.clear()
+        st.rerun()
+
     subs = scoring.get_submissions_overview()
 
     if subs.empty:
@@ -942,6 +973,7 @@ def tab_submissions() -> None:
         else:
             scoring.accept_submission(sub_id, after, reviewer, notes or None)
             _cached_leaderboard.clear()
+            _pending_count.clear()
             st.success(
                 f"Accepted — {sub['team']} now scores {after:.0f} on this "
                 f"scenario ({after - current:+.0f} to their total)."
@@ -951,10 +983,12 @@ def tab_submissions() -> None:
     a1, a2 = st.columns(2)
     if a1.button("🔄 Reopen for resubmission"):
         scoring.set_submission_status(sub_id, "reopened", reviewer)
+        _pending_count.clear()
         st.success("Reopened — the team can submit again.")
         st.rerun()
     if a2.button("🚫 Void submission"):
         scoring.set_submission_status(sub_id, "void", reviewer)
+        _pending_count.clear()
         st.warning("Submission voided.")
         st.rerun()
 
@@ -1289,6 +1323,7 @@ def tab_setup() -> None:
         if st.button("Delete all submissions", type="primary",
                      disabled=confirm_subs != "DELETE"):
             scoring.delete_all_submissions()
+            _pending_count.clear()
             st.session_state.pop("evidence_zip", None)
             st.session_state.pop("evidence_zip_ready", None)
             st.success("All submissions deleted.")
@@ -1301,8 +1336,10 @@ def tab_setup() -> None:
 is_trainer = trainer_gate()
 
 if is_trainer:
+    _pending = _pending_count()
     tabs = st.tabs([
-        "🏆 Leaderboard", "📤 Submit Work", "📥 Submissions",
+        "🏆 Leaderboard", "📤 Submit Work",
+        f"📥 Submissions ({_pending})" if _pending else "📥 Submissions",
         "📝 Score Entry", "📋 Scenarios", "⚙️ Setup",
     ])
     with tabs[0]:

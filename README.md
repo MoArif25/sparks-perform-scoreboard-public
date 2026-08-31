@@ -18,23 +18,48 @@ or accounts required.
 
 ## How it works
 
-- **Submit Work (teams):** a team picks itself and a scenario, answers the
-  scenario questions (if any have been authored), writes a short summary,
-  optionally attaches evidence files, and self-reports the points it believes it
-  earned. **One submission per team per scenario.** After submitting, the team
-  sees *"Submitted — pending trainer review"*.
-- **Submissions inbox (trainers):** review a submission, download its evidence,
-  then **Accept** to post points to the leaderboard, **Reopen** to let the team
-  resubmit, or **Void** it. Accepting writes to the same score table the manual
-  form uses, so the leaderboard is unchanged.
+- **Submit Work (teams):** a team picks itself, then selects **one or several
+  scenarios**. Each scenario gets its own block for answers (if questions have
+  been authored), a short summary, optional evidence files, and the points the
+  team believes it earned. **One submission per team per scenario** — already
+  submitted scenarios are removed from the picker and listed with their status.
+  The whole batch is validated before anything is written, so a partial batch
+  never lands. After submitting, the team sees *"pending trainer review"*.
+- **Submissions inbox (trainers):** a live counter shows how many submissions
+  await review, and the count also appears on the tab label. **Bulk review**
+  lists pending submissions as an editable grid — set an award per row, tick the
+  ones to post, check the preview, and accept them together. A detail panel
+  below handles one submission at a time when you need to read the summary or
+  download evidence. **Reopen** lets a team resubmit; **Void** rejects.
+- **Awarding points:** accepting writes to the same score table the manual form
+  uses. Choose **Replace** (the scenario ends up worth exactly the award — the
+  normal case) or **Add** (the award is added to the scenario's existing score,
+  for scenarios marked in several parts). Both paths show the scenario's current
+  score, the resulting score, and the change to the team's total before you
+  commit. The resulting score is validated against the scenario maximum.
 - **Score Entry (trainers):** unchanged manual path — pick a team + scenario,
   enter points, time taken, and whether the solution passed. Still available as
   a fallback alongside the submission flow.
 - **Speed bonus:** in each scenario, the fastest *passing* teams get bonus
   points (default `5, 3, 2, 1` for the top four). Configurable in **Setup**.
-  Submissions do not record time, so accepted submissions earn no speed bonus.
+  Submissions do not record a time, so accepting one preserves whatever time was
+  already recorded rather than clearing it — clearing would drop the team out of
+  that scenario's ranking and shift bonus points to every other team.
 - **Leaderboard:** `Total = reviewer points + speed bonus`. Ties broken by total
   time (faster wins). Auto-refreshes every 15 seconds — great for a projector.
+  The live block is rendered as a single HTML table rather than Streamlit
+  widgets, which would remount on every refresh and visibly flicker.
+
+### Between events
+
+Run both resets in **Setup**, in this order:
+
+1. **Reset all scores** — clears the leaderboard.
+2. **Delete all submissions** — clears submissions, answers and evidence.
+   Skipping this leaves the one-per-team-per-scenario rows in place, which
+   silently blocks teams from submitting next time.
+
+Export from the Submissions tab first; neither reset can be undone.
 
 ### Scenario questions (sub-scenarios)
 
@@ -45,7 +70,8 @@ automatically — no code change needed. Each item already carries dormant
 `verify_type` / `verify_config` columns for automatic grading in a later step.
 
 Evidence files are stored inline in Postgres (Streamlit Cloud's filesystem is
-ephemeral), capped at 5 MB per file and 4 files per submission.
+ephemeral), capped at 5 MB per file and 4 files per submission. The Submissions
+tab shows total evidence size and exports submissions, answers and all files.
 
 - **Submissions** of the actual work stay in SharePoint/Teams as usual; this app
   only tracks scoring + ranking.

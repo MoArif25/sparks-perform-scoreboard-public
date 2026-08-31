@@ -1142,6 +1142,14 @@ def accept_submission(
             (float(final_points), reviewer, notes, submission_id))
 
 
+def count_pending_submissions() -> int:
+    """Submissions waiting on a trainer decision."""
+    with _connect() as conn:
+        row = _fetchone(conn,
+            "SELECT COUNT(*) AS n FROM submissions WHERE status='submitted'")
+    return int(row["n"]) if row else 0
+
+
 def get_recorded_points() -> dict[tuple[int, int], float]:
     """(team_id, scenario_num) -> points already on the leaderboard.
 
