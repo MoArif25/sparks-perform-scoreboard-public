@@ -317,13 +317,12 @@ def tab_score_entry() -> None:
     )
 
     max_points = int(scen_lookup.loc[scen_num, "max_points"])
-    est_minutes = scen_lookup.loc[scen_num, "est_minutes"]
     scoring_text = scen_lookup.loc[scen_num, "scoring"]
 
-    st.caption(
-        f"Max reviewer points: **{max_points}** · Scoring: *{scoring_text}*"
-        + (f" · Suggested: ~{int(est_minutes)} min" if pd.notna(est_minutes) else "")
-    )
+    caption = f"Max reviewer points: **{max_points}**"
+    if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
+        caption += f" · Scoring: *{scoring_text}*"
+    st.caption(caption)
 
     existing = scoring.get_score(team_id, int(scen_num)) or {}
     with st.form("score_form", clear_on_submit=False):
@@ -403,10 +402,6 @@ def _parse_options(raw: str | None) -> list[str]:
     return [o.strip() for o in str(raw).split(separator) if o.strip()]
 
 
-# Extra optional part slots shown per scenario, for sub-scenarios.
-EXTRA_PART_SLOTS = 2
-
-
 @st.cache_data(ttl=60, show_spinner=False)
 def _catalog_scenarios() -> pd.DataFrame:
     """Shared across sessions, so many teams submitting at once don't each
@@ -455,15 +450,9 @@ def _render_item(item: pd.Series, key_prefix: str) -> dict:
 
 
 def _render_scenario_block(scen_num: int, part: int, title: str,
-                           max_points: int, scoring_text) -> dict:
+                           max_points: int) -> dict:
     """Render one part of one scenario and collect its submission payload."""
     prefix = f"s{scen_num}_p{part}"
-
-    if part == 0:
-        caption = f"Max points: **{max_points}**"
-        if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
-            caption += f" · Scoring: *{scoring_text}*"
-        st.caption(caption)
 
     part_label = st.text_input(
         "Which part / sub-scenario is this? (optional)",
@@ -600,11 +589,18 @@ def tab_submit() -> None:
         return
 
     st.caption(
-        f"Each scenario has room for up to {1 + EXTRA_PART_SLOTS} parts, for when "
-        "one scenario is split into sub-scenarios. Fill in only what you need — "
-        "empty parts are ignored. A trainer can accept several parts and the "
-        "points add up."
+        "Each scenario opens with tabs for its parts, for when one scenario is "
+        "split into sub-scenarios. Fill in only the parts you need — empty ones "
+        "are ignored. A trainer can accept several parts and the points add up."
     )
+
+    # Outside the form so raising it takes effect immediately; inside the form
+    # it could not change the number of rendered tabs.
+    part_slots = int(st.number_input(
+        "Parts per scenario", min_value=1, max_value=25, value=3, step=1,
+        key="submit_part_slots",
+        help="Raise this if a scenario has more sub-scenarios than tabs shown.",
+    ))
 
     with st.form("submit_form", clear_on_submit=False):
         blocks = []
@@ -614,13 +610,21 @@ def tab_submit() -> None:
             scoring_text = scen_lookup.loc[n, "scoring"]
 
             st.markdown(f"##### #{n} — {title}")
-            blocks.append(_render_scenario_block(
-                n, 0, title, max_points, scoring_text))
+            caption = f"Max points: **{max_points}** for all parts combined"
+            if pd.notna(scoring_text) and str(scoring_text).strip() not in ("", "TBD"):
+                caption += f" · Scoring: *{scoring_text}*"
+            st.caption(caption)
 
-            for part in range(1, EXTRA_PART_SLOTS + 1):
-                with st.expander(f"➕ Another part of #{n} (optional)"):
-                    blocks.append(_render_scenario_block(
-                        n, part, title, max_points, scoring_text))
+            if part_slots == 1:
+                blocks.append(_render_scenario_block(n, 0, title, max_points))
+            else:
+                # Tabs keep the page short however many parts are open, which
+                # stacked expanders did not.
+                tabs = st.tabs([f"Part {p + 1}" for p in range(part_slots)])
+                for p, tab in enumerate(tabs):
+                    with tab:
+                        blocks.append(
+                            _render_scenario_block(n, p, title, max_points))
             st.divider()
 
         submitted_by = st.text_input("Submitted by (optional)",
