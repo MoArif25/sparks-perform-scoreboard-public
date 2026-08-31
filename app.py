@@ -760,11 +760,18 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
     st.subheader("Bulk review")
 
     mode = _award_mode("bulk_award_mode")
-    st.caption(
-        "**Current** is what the scenario scores today · **Award** is your "
-        "decision · **After** is what the scenario will score once accepted · "
-        "**Δ Total** is how the team's overall total moves."
-    )
+    if mode == "add":
+        st.caption(
+            "**Add mode** — the scenario's new score is **After = Current + "
+            "Award**. Only the **Award** is added to the team's total. "
+            "**After** must still fit inside the scenario's **Max**."
+        )
+    else:
+        st.caption(
+            "**Replace mode** — the scenario's new score is **After = Award**, "
+            "overwriting **Current**. The team's total moves by "
+            "**Award − Current**, shown as **Δ Total**."
+        )
 
     recorded = scoring.get_recorded_points()
     grid = view[["id", "team_id", "team", "scenario_num", "scenario",
@@ -817,9 +824,16 @@ def _render_bulk_review(view: pd.DataFrame, subs: pd.DataFrame) -> None:
     over = chosen[chosen["After"] > chosen["Max"]]
     if not over.empty:
         for _, r in over.iterrows():
+            if mode == "add":
+                sums = (f'{r["Current"]:.0f} already scored + {r["Award"]:.0f} '
+                        f'awarded = {r["After"]:.0f}')
+            else:
+                sums = f'award of {r["Award"]:.0f}'
             st.error(
-                f'#{int(r["#"])} {r["Team"]}: that would score '
-                f'{r["After"]:.0f}, above the scenario max of {r["Max"]:.0f}.'
+                f'#{int(r["#"])} {r["Team"]}: {sums}, which is above this '
+                f'scenario\'s max of {r["Max"]:.0f}. Lower the Award to at most '
+                f'{max(r["Max"] - (r["Current"] if mode == "add" else 0), 0):.0f}, '
+                "or switch to Replace mode."
             )
         return
 
@@ -967,8 +981,11 @@ def tab_submissions() -> None:
     if accept:
         if after > max_points:
             st.error(
-                f"That would score {after:.0f}, above the scenario max of "
-                f"{max_points}."
+                f"{current:.0f} already scored + {award:.0f} awarded = "
+                f"{after:.0f}, which is above this scenario's max of "
+                f"{max_points}. Lower the award to at most "
+                f"{max(max_points - (current if mode == 'add' else 0), 0):.0f}, "
+                "or switch to Replace mode."
             )
         else:
             scoring.accept_submission(sub_id, after, reviewer, notes or None)
