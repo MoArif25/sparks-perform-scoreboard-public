@@ -594,14 +594,18 @@ def tab_submit() -> None:
         "are ignored. A trainer can accept several parts and the points add up."
     )
 
-    # Outside the form so raising it takes effect immediately; inside the form
-    # it could not change the number of rendered tabs.
-    part_slots = int(st.number_input(
-        "Parts per scenario", min_value=1, max_value=25, value=1, step=1,
-        key="submit_part_slots",
-        help="Only raise this if a scenario is split into sub-scenarios. Each "
-             "extra part makes the form longer.",
-    ))
+    # Outside the form: these decide how many tabs get rendered, and a widget
+    # inside a form cannot change that until the form is submitted.
+    st.markdown("**How many parts does each scenario need?**")
+    part_counts: dict[int, int] = {}
+    columns = st.columns(min(len(picked), 4))
+    for i, n in enumerate(picked):
+        with columns[i % len(columns)]:
+            part_counts[n] = int(st.number_input(
+                f"#{n}", min_value=1, max_value=25, value=1, step=1,
+                key=f"parts_{n}",
+                help=str(scen_lookup.loc[n, "title"]),
+            ))
 
     with st.form("submit_form", clear_on_submit=False):
         submitted_by = st.text_input("Submitted by (optional)",
@@ -618,6 +622,7 @@ def tab_submit() -> None:
             title = str(scen_lookup.loc[n, "title"])
             max_points = int(scen_lookup.loc[n, "max_points"])
             scoring_text = scen_lookup.loc[n, "scoring"]
+            slots = part_counts[n]
 
             st.markdown(f"##### #{n} — {title}")
             caption = f"Max points: **{max_points}** for all parts combined"
@@ -625,12 +630,12 @@ def tab_submit() -> None:
                 caption += f" · Scoring: *{scoring_text}*"
             st.caption(caption)
 
-            if part_slots == 1:
+            if slots == 1:
                 blocks.append(_render_scenario_block(n, 0, title, max_points))
             else:
                 # Tabs keep the page short however many parts are open, which
                 # stacked expanders did not.
-                tabs = st.tabs([f"Part {p + 1}" for p in range(part_slots)])
+                tabs = st.tabs([f"Part {p + 1}" for p in range(slots)])
                 for p, tab in enumerate(tabs):
                     with tab:
                         blocks.append(
