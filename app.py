@@ -35,20 +35,33 @@ st.set_page_config(
 )
 
 # --- One-time startup: init DB, seed teams, sync catalog -> scoring DB -------- #
-_startup_error = None
-try:
-    if scoring.backend_name() != "pg":
-        raise RuntimeError(
-            "Postgres backend is required. Set Streamlit secret DATABASE_URL "
-            "to your Supabase session pooler connection string."
-        )
-    scoring.init_db()
-    scoring.ensure_default_teams(10)
-    scoring.sync_scenarios(catalog.core_scenarios())
-except Exception as exc:
-    _startup_error = str(exc)
+@st.cache_resource(show_spinner=False)
+def _run_startup() -> str | None:
+    """Runs once per process, not per rerun.
+
+    As module-level code this fired on every interaction: ~10 CREATE TABLE
+    statements, the migrations, and an upsert per scenario, all against
+    Supabase before anything could render. sync_scenarios is also called from
+    catalog.save_catalog(), so the catalog still stays in step.
+    """
+    try:
+        if scoring.backend_name() != "pg":
+            raise RuntimeError(
+                "Postgres backend is required. Set Streamlit secret DATABASE_URL "
+                "to your Supabase session pooler connection string."
+            )
+        scoring.init_db()
+        scoring.ensure_default_teams(10)
+        scoring.sync_scenarios(catalog.core_scenarios())
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+_startup_error = _run_startup()
 
 if _startup_error:
+    _run_startup.clear()   # let the next run retry instead of caching the failure
     st.error("Database startup failed. The app is running, but cannot connect to Postgres.")
     st.code(_startup_error)
     st.markdown(
@@ -410,6 +423,22 @@ def _catalog_scenarios() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def _catalog_full() -> pd.DataFrame:
+    return catalog.load_catalog()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_teams() -> pd.DataFrame:
+    return scoring.get_teams()
+
+
+def _clear_catalog_caches() -> None:
+    _catalog_scenarios.clear()
+    _catalog_full.clear()
+    _scenario_items.clear()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def _scenario_items(scenario_num: int) -> pd.DataFrame:
     return scoring.get_scenario_items(scenario_num)
 
@@ -546,7 +575,7 @@ def _validate_block(block: dict) -> str | None:
 
 def tab_submit() -> None:
     st.header("📤 Submit Your Work")
-    teams = scoring.get_teams()
+    teams = _cached_teams()
     scen = _catalog_scenarios()
 
     if teams.empty:
@@ -1075,7 +1104,7 @@ def tab_scenarios(can_edit: bool) -> None:
     st.header("📋 Micro-Scenario Catalog")
 
     if not can_edit:
-        df = catalog.load_catalog()
+        df = _catalog_full()
         st.caption("Read-only view. Trainers can edit via the sidebar login.")
         st.dataframe(df, hide_index=True, use_container_width=True)
         return
@@ -1161,8 +1190,7 @@ def tab_scenarios(can_edit: bool) -> None:
                             else:
                                 catalog.save_catalog(merged)
                                 _cached_leaderboard.clear()
-                                _catalog_scenarios.clear()
-                                _scenario_items.clear()
+                                _clear_catalog_caches()
                                 st.session_state["catalog_df"] = catalog.load_catalog()
                                 st.session_state["last_csv_import_sig"] = file_sig
                                 st.session_state["csv_import_nonce"] += 1
@@ -1222,8 +1250,7 @@ def tab_scenarios(can_edit: bool) -> None:
             else:
                 catalog.save_catalog(edited)
                 _cached_leaderboard.clear()
-                _catalog_scenarios.clear()
-                _scenario_items.clear()
+                _clear_catalog_caches()
                 # Ensure other tabs (score entry / leaderboard) re-read the
                 # just-saved catalog in the same user interaction.
                 st.session_state.pop("catalog_df", None)
@@ -1272,6 +1299,8 @@ def tab_setup() -> None:
         new_name = st.text_input("Add a team", placeholder="e.g. Team Red")
         if st.button("➕ Add team") and new_name.strip():
             scoring.add_team(new_name)
+            _cached_teams.clear()
+            _cached_leaderboard.clear()
             st.rerun()
     with c2:
         if not teams.empty:
@@ -1281,6 +1310,8 @@ def tab_setup() -> None:
             )
             if st.button("🗑️ Delete team"):
                 scoring.delete_team(del_id)
+                _cached_teams.clear()
+                _cached_leaderboard.clear()
                 st.rerun()
 
     st.divider()
@@ -1396,30 +1427,44 @@ def tab_setup() -> None:
 # --------------------------------------------------------------------------- #
 is_trainer = trainer_gate()
 
-if is_trainer:
-    _pending = _pending_count()
-    tabs = st.tabs([
-        "🏆 Leaderboard", "📤 Submit Work",
-        f"📥 Submissions ({_pending})" if _pending else "📥 Submissions",
-        "📝 Score Entry", "📋 Scenarios", "⚙️ Setup",
-    ])
-    with tabs[0]:
-        tab_leaderboard()
-    with tabs[1]:
-        tab_submit()
-    with tabs[2]:
-        tab_submissions()
-    with tabs[3]:
-        tab_score_entry()
-    with tabs[4]:
-        tab_scenarios(can_edit=True)
-    with tabs[5]:
-        tab_setup()
-else:
-    tabs = st.tabs(["🏆 Leaderboard", "📤 Submit Work", "📋 Scenarios"])
-    with tabs[0]:
-        tab_leaderboard()
-    with tabs[1]:
-        tab_submit()
-    with tabs[2]:
-        tab_scenarios(can_edit=False)
+# st.tabs executes every tab body on every rerun, so typing on one tab also
+# rebuilt the leaderboard, its chart and the whole scenario catalog. Rendering
+# only the chosen section keeps each rerun to the work actually being looked at.
+SECTIONS = {
+    "leaderboard": "🏆 Leaderboard",
+    "submit": "📤 Submit Work",
+    "submissions": "📥 Submissions",
+    "score": "📝 Score Entry",
+    "scenarios": "📋 Scenarios",
+    "setup": "⚙️ Setup",
+}
+options = (list(SECTIONS) if is_trainer
+           else ["leaderboard", "submit", "scenarios"])
+
+_pending = _pending_count() if is_trainer else 0
+
+
+def _section_label(key: str) -> str:
+    if key == "submissions" and _pending:
+        return f"{SECTIONS[key]} ({_pending})"
+    return SECTIONS[key]
+
+
+section = st.radio(
+    "Section", options, format_func=_section_label,
+    horizontal=True, label_visibility="collapsed", key="nav_section",
+)
+st.divider()
+
+if section == "leaderboard":
+    tab_leaderboard()
+elif section == "submit":
+    tab_submit()
+elif section == "submissions":
+    tab_submissions()
+elif section == "score":
+    tab_score_entry()
+elif section == "scenarios":
+    tab_scenarios(can_edit=is_trainer)
+elif section == "setup":
+    tab_setup()
